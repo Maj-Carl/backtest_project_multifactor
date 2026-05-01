@@ -1,4 +1,8 @@
-"""接口B：api_stock_kline_daily_th（按交易日拉全市场快照）。"""
+"""接口B：api_stock_kline_daily_th（按交易日拉全市场快照）。
+
+字段约定（与本仓库线上核对一致）：
+- volume：成交量，单位为「股」，不是「手」（1 手 = 100 股）。与接口原始列名一致，本模块不做手/股换算。
+"""
 
 from __future__ import annotations
 
@@ -47,12 +51,23 @@ def _parse_th_code(raw) -> str:
     return m.group(1) if m else s
 
 
-def fetch_daily_th_market(api_key: str, trade_date: str, *, verbose: bool = False) -> pd.DataFrame:
-    """拉取接口B指定交易日的全市场数据。"""
-    if trade_date in _MARKET_CACHE:
+def fetch_daily_th_market(
+    api_key: str,
+    trade_date: str,
+    *,
+    verbose: bool = False,
+    timeout: tuple[float, float] | None = None,
+    use_cache: bool = True,
+) -> pd.DataFrame:
+    """拉取接口B指定交易日的全市场数据。
+
+    返回 DataFrame 中 ``volume`` 列为当日成交量，单位：股。
+    """
+    if use_cache and trade_date in _MARKET_CACHE:
         return _MARKET_CACHE[trade_date]
 
-    resp = requests.get(DAILY_TH_URL, params={"key": api_key, "date": trade_date}, timeout=(5, 45))
+    connect_t, read_t = timeout if timeout is not None else (5.0, 45.0)
+    resp = requests.get(DAILY_TH_URL, params={"key": api_key, "date": trade_date}, timeout=(connect_t, read_t))
     resp.raise_for_status()
     payload = resp.json()
     status = payload.get("status")
@@ -68,7 +83,23 @@ def fetch_daily_th_market(api_key: str, trade_date: str, *, verbose: bool = Fals
     df = pd.DataFrame(data=rows, columns=cols)
     df["code"] = df["code"].map(_parse_th_code)
     df["date"] = pd.to_datetime(df["date"])
-    for c in ("open", "high", "low", "close", "volume", "amount", "prev_close", "avg_price"):
+    # volume：成交量（股）；与接口返回值一致，不转换为「手」。
+    # 接口偶发返回字符串数值；与本地 float 合并写 Parquet 时需统一为数值，避免 mixed object 报错。
+    for c in (
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "amount",
+        "prev_close",
+        "avg_price",
+        "high_limit",
+        "low_limit",
+        "factor",
+        "is_paused",
+        "is_st",
+    ):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     if "turnover_rate" in df.columns:
@@ -76,7 +107,8 @@ def fetch_daily_th_market(api_key: str, trade_date: str, *, verbose: bool = Fals
     elif "turnover" not in df.columns:
         df["turnover"] = 0.0
 
-    _MARKET_CACHE[trade_date] = df
+    if use_cache:
+        _MARKET_CACHE[trade_date] = df
     if len(_MARKET_CACHE) > _CACHE_MAX:
         for k in list(_MARKET_CACHE.keys())[: len(_MARKET_CACHE) - _CACHE_MAX + 16]:
             _MARKET_CACHE.pop(k, None)
@@ -92,7 +124,10 @@ def fetch_daily_th_bars_for_code(
     verbose: bool = False,
     cache_dir: Path | None = None,
 ) -> pd.DataFrame:
-    """按交易日拼接接口B，返回单只股票区间日线。"""
+    """按交易日拼接接口B，返回单只股票区间日线。
+
+    单列合并后 ``volume`` 仍为成交量（股），按日去重、排序。
+    """
     code_z = str(code).strip().zfill(6) if str(code).strip().isdigit() else str(code).strip()
     parts: list[pd.DataFrame] = []
     for d in get_trade_days(start_date, end_date, cache_dir=cache_dir, period="1d", ty="个股"):

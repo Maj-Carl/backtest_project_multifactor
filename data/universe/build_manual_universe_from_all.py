@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -20,7 +20,12 @@ def main():
     args = parser.parse_args()
 
     source_path = Path(args.source)
+    if not source_path.is_absolute():
+        source_path = PROJECT_ROOT / source_path
     target_path = Path(args.target)
+    if not target_path.is_absolute():
+        target_path = PROJECT_ROOT / target_path
+
     if not source_path.exists():
         raise FileNotFoundError(f"找不到全A股票池文件: {source_path}")
 

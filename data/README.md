@@ -29,9 +29,18 @@ data/
     price_factors.py
   universe/                       # 股票池
     builder.py
+    build_a_share_universe.py      # CLI：刷新全 A 代码表 → a_share_codes.csv
+    build_manual_universe_from_all.py # CLI：从全 A CSV 生成手动池模板
     a_share_codes.csv
     manual_universe_template.csv
 ```
+
+## 股票池命令行（`data/universe/`）
+
+在项目根目录执行：
+
+- `python data/universe/build_a_share_universe.py` — 联网生成/覆盖 `a_share_codes.csv`
+- `python data/universe/build_manual_universe_from_all.py` — 从全 A 表筛出手动池模板 CSV
 
 ## 推荐导入入口
 

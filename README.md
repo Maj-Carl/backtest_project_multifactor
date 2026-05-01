@@ -30,7 +30,7 @@
 - `backtest/`：Backtrader 引擎封装
 - `reports/`：报告生成与输出文件
 - `utils/`：日志等通用工具
-- `scripts/`：运维/数据工具脚本（已从根目录收敛）
+- `scripts/`：仅保留 `cleanup_project.py`（清理本仓库运行产物）
 
 ## 常用命令
 
@@ -55,26 +55,24 @@
 - 接口B（按交易日拼单只股票区间）
   - `python data/fetch/apis/api_kline_daily_th.py --mode code_range --code 000001 --start 2025-04-15 --end 2025-04-30 --cache-dir "C:\投资\STOCK_DATA"`
 
-## scripts 工具脚本
+## 股票池与数据辅助（`data/universe/`、`data/fetch/apis`）
 
-- 预抓取股票池行情到本地仓
-  - `python scripts/prefetch_universe_data.py`
-- 查看本地仓 catalog 状态
-  - `python scripts/inspect_store_status.py`
-- 校验本地与远端数据一致性
-  - `python scripts/verify_stock_data.py --code 600000 --start 2025-04-15 --end 2026-04-15`
-- 生成全 A 股票清单
-  - `python scripts/build_a_share_universe.py`
-- 从全 A 清单生成手动股票池模板
-  - `python scripts/build_manual_universe_from_all.py`
-- 参数扫描
-  - `python scripts/tune_multifactor.py`
-- 接口B 单日全市快照预览（可看字段与样例）
-  - `python data/fetch/apis/api_kline_daily_th.py --mode market --date 2025-10-24`
-- 按 Config 区间用 daily_th 向 `MULTI_STOCK_CACHE_DIR` 补 Parquet（约每个交易日全市一次）
-  - `python scripts/supplement_silver_daily_th.py`
-  - 仅回测 universe、加快：`python scripts/supplement_silver_daily_th.py --universe-only`
-  - 先试跑 3 个交易日：`python scripts/supplement_silver_daily_th.py --universe-only --max-days 3`
+- 生成全 A 股票清单：`python data/universe/build_a_share_universe.py`
+- 从全 A 生成手动池模板：`python data/universe/build_manual_universe_from_all.py`
+- 接口调试（含接口 B 单日全市预览）：见上文「数据接口调试」
+
+说明：原 `scripts/` 下预抓取、catalog 查看、手工对账、`daily_th` 补仓、参数扫描等 CLI 已从本仓库移除；需要时可从 Git 历史恢复。
+
+## 清理运行产物与缓存
+
+在项目根目录执行。**默认只动本仓库内文件**，不会删除 `Config.MULTI_STOCK_CACHE_DIR` 下的 parquet / DuckDB。
+
+- 常规清理：`python scripts/cleanup_project.py`
+- 先看会删什么：`python scripts/cleanup_project.py --dry-run`
+- 顺带清空仓库内遗留的 `data/multi_cache/`：`python scripts/cleanup_project.py --include-local-multi-cache`
+- 只清理外盘缓存目录里的边角（失败代码列表、`locks/*.lock`），不误删 silver：`python scripts/cleanup_project.py --cache-dir-delete-junk "C:\投资\STOCK_DATA"`
+
+覆盖范围：`reports/*.html`、`logs/` 下的 `.log`、`**/__pycache__`、常见测试缓存目录（`.pytest_cache`、`htmlcov`、`.coverage`、`.mypy_cache`、`.ruff_cache`）。
 
 ## 说明
 
@@ -95,7 +93,7 @@
 
 - 这通常是接口波动，不一定是代码错误
 - 先用冒烟命令验证主链路：`python run_multifactor.py --smoke`
-- 如果全量回测频繁超时，优先先做本地预抓取：`python scripts/prefetch_universe_data.py`
+- 如果全量回测频繁超时：缩小股票池与日期区间、或使用冒烟参数；必要时自备本地 Parquet/DuckDB 数据（或通过 `data/` 模块自写补仓逻辑）
 
 ### 3) 控制台中文乱码
 
@@ -109,5 +107,5 @@
 
 ### 5) 本地数据是否可信，怎么快速核验
 
-- 使用：`python scripts/verify_stock_data.py --code 600000 --start 2026-03-01 --end 2026-03-31`
-- 接口不可用时，在线抽样会被跳过并提示，不会无限阻塞
+- 回测链路在装载结束后会按需做「按日全日快照 × 抽样日 × 标的池」在线抽样（见 `Config.DATA_SAMPLING_CHECK_*`，接口不可用时整段跳过并打日志）。
+- 更细的手工区间对账可自行调用 `data.storage.bar_store.compare_local_vs_remote`，或从 Git 历史恢复已删除的运维脚本。
