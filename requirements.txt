@@ -1,0 +1,8 @@
+backtrader
+pandas
+quantstats
+matplotlib
+requests
+akshare
+duckdb
+pyarrow
