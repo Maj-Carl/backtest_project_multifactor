@@ -7,6 +7,7 @@ from pathlib import Path
 from config.config import Config
 from data.fetch.api_keys import load_api_key_from_file
 from data.storage.bar_store import load_or_update_bars
+from utils.logger import get_backtest_logger
 
 
 def get_stock_data(
@@ -36,9 +37,9 @@ def get_stock_data(
         verbose=verbose,
     )
     if verbose:
-        print(f"共获取到 {len(df)} 条数据")
-        print("\n数据前5行：")
-        print(df.head())
+        log = get_backtest_logger()
+        log.info("共获取到 %s 条数据", len(df))
+        log.info("数据前5行:\n%s", df.head().to_string())
 
     df.set_index("date", inplace=True)
     return df

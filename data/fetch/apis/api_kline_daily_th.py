@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.fetch.trade_calendar import get_trade_days
+from utils.logger import get_backtest_logger
 
 DAILY_TH_URL = "http://39.98.238.239/api_stock_kline_daily_th/"
 _MARKET_CACHE: dict[str, pd.DataFrame] = {}
@@ -136,7 +137,7 @@ def fetch_daily_th_bars_for_code(
             mkt = fetch_daily_th_market(api_key, ds, verbose=verbose)
         except (ValueError, requests.RequestException, OSError) as exc:
             if verbose:
-                print(f"[daily_th] {ds} 跳过: {exc}")
+                get_backtest_logger().info("[daily_th] %s 跳过: %s", ds, exc)
             continue
         sub = mkt[mkt["code"].astype(str) == code_z]
         if not sub.empty:

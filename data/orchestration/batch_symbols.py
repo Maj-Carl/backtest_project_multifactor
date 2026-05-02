@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import Counter
 from pathlib import Path
@@ -10,6 +11,13 @@ from typing import Any
 from data.storage.bar_store import (
     batch_online_sample_check_daily_th_cross_section,
     load_or_update_bars,
+    reset_phase_a_microtimings,
+    take_phase_a_microtimings,
+)
+from utils.logger import (
+    get_backtest_logger,
+    get_debug_logger,
+    log_performance_event,
 )
 
 
@@ -45,16 +53,43 @@ def get_multiple_stock_data(
     failed_codes = []
     staged_local_for_sampling: dict[str, Any] = {}
     ingest_snapshots: list[dict[str, Any]] | None = [] if verbose else None
-    if verbose:
-        mode = "本地优先（不足再拉接口）" if use_local else "不向本地读取（use_local=False）"
-        print(
-            f"[行情装载] 正在加载 {len(codes)} 只标的 {period}/{ty} 行情，"
-            f"区间 {start_date}～{end_date}，silver 仓库 {cache_dir.resolve()}。"
-            f"{mode}",
-            flush=True,
+    total_n = len(codes)
+
+    def _progress_interval(n: int) -> int:
+        if n <= 20:
+            return 1
+        return max(1, min(200, n // 50))
+
+    report_every = _progress_interval(total_n)
+    db = get_debug_logger("batch")
+    if db.isEnabledFor(logging.DEBUG):
+        db.debug(
+            "phase A start n=%s period=%s ty=%s range=%s~%s cache_dir=%s use_local=%s",
+            total_n,
+            period,
+            ty,
+            start_date,
+            end_date,
+            str(cache_dir.resolve()),
+            use_local,
         )
 
-    for code in codes:
+    if verbose:
+        mode = "本地优先（不足再拉接口）" if use_local else "不向本地读取（use_local=False）"
+        get_backtest_logger().info(
+            "[行情装载] 正在加载 %s 只标的 %s/%s 行情，区间 %s～%s，silver 仓库 %s。%s",
+            total_n,
+            period,
+            ty,
+            start_date,
+            end_date,
+            cache_dir.resolve(),
+            mode,
+        )
+
+    reset_phase_a_microtimings()
+    t_load = time.perf_counter()
+    for idx, code in enumerate(codes):
         code_key = str(code).zfill(6)
         try:
             df = load_or_update_bars(
@@ -78,10 +113,84 @@ def get_multiple_stock_data(
         except Exception as exc:
             if continue_on_error:
                 if verbose:
-                    print(f"[{code_key}] 拉取失败（已跳过）: {exc}")
+                    get_backtest_logger().info(
+                        "[%s] 拉取失败（已跳过）: %s", code_key, exc
+                    )
                 failed_codes.append(code_key)
             else:
                 raise
+
+        done = idx + 1
+        if verbose and (done == 1 or done == total_n or done % report_every == 0):
+            elapsed = time.perf_counter() - t_load
+            pct = 100.0 * done / total_n
+            rate = done / elapsed if elapsed > 0 else 0.0
+            eta_s = (total_n - done) / rate if rate > 0 else 0.0
+            get_backtest_logger().info(
+                "[行情装载] 进度 %s/%s (%.1f%%) | 当前 %s | 已用 %.1fs | 预计剩余 %.1fs",
+                done,
+                total_n,
+                pct,
+                code_key,
+                elapsed,
+                eta_s,
+            )
+        if db.isEnabledFor(logging.DEBUG) and (
+            done == 1 or done == total_n or done % report_every == 0
+        ):
+            elapsed = time.perf_counter() - t_load
+            rate = done / elapsed if elapsed > 0 else 0.0
+            eta_s = (total_n - done) / rate if rate > 0 else 0.0
+            db.debug(
+                "progress %s/%s code=%s elapsed_s=%.3f eta_s=%.3f",
+                done,
+                total_n,
+                code_key,
+                elapsed,
+                eta_s,
+            )
+
+    t_after_phase_a = time.perf_counter()
+    micro = take_phase_a_microtimings()
+    nsym = int(micro["symbols"]) or 0
+    if nsym > 0:
+        parts_sum = (
+            micro["read_s"]
+            + micro["gaps_s"]
+            + micro["fetch_s"]
+            + micro["persist_s"]
+            + micro["lock_s"]
+            + micro["merge_s"]
+            + micro["dedupe_s"]
+            + micro["log_s"]
+            + micro["other_s"]
+        )
+        log_performance_event(
+            "data/orchestration/batch_symbols.py",
+            kind="批量行情",
+            step="阶段 A 子耗时累计（各只 load_or_update_bars 内分项之和）",
+            code=(
+                "read/gaps/fetch/persist 见上 | lock=_acquire_symbol_lock | "
+                "merge=循环内 concat 并入远端块 | dedupe=drop_duplicates+sort+请求区间切片 | "
+                "log=DuckDB ingest_runs（仅写 silver 并更新 bar_catalog 后）| other=余项（verbose 分支、DEBUG 等）"
+            ),
+            metrics=(
+                f"n_sym={nsym} | read={micro['read_s']:.3f}s | gaps={micro['gaps_s']:.3f}s | "
+                f"fetch={micro['fetch_s']:.3f}s | persist={micro['persist_s']:.3f}s || "
+                f"lock={micro['lock_s']:.3f}s | merge={micro['merge_s']:.3f}s | "
+                f"dedupe={micro['dedupe_s']:.3f}s | log={micro['log_s']:.3f}s | "
+                f"other={micro['other_s']:.3f}s || sum_parts={parts_sum:.3f}s | "
+                f"wall_阶段A={t_after_phase_a - t_load:.3f}s"
+            ),
+        )
+    log_performance_event(
+        "data/orchestration/batch_symbols.py",
+        kind="批量行情",
+        step="阶段 A 结束：逐标的从本地/远程装载并补缺",
+        code="data/storage/bar_store.py:load_or_update_bars（本函数内 for 循环）",
+        elapsed_s=t_after_phase_a - t_load,
+        metrics=f"n_codes={total_n} | ok={len(result)} | failed={len(failed_codes)}",
+    )
 
     # 阶段 A 收尾必须先于在线抽样打印，避免终端上「在线抽样」看起来早于「装载完成」。
     if verbose and ingest_snapshots is not None:
@@ -111,20 +220,36 @@ def get_multiple_stock_data(
             if len(failed_codes) > 16:
                 bad += f" …共{len(failed_codes)}只"
             line += f" 另：拉取失败已跳过 {len(failed_codes)} 只：{bad}"
-        print(line, flush=True)
+        get_backtest_logger().info("%s", line)
+
+    if db.isEnabledFor(logging.DEBUG):
+        db.debug(
+            "phase A end ok=%s failed=%s elapsed_s=%.3f",
+            len(result),
+            len(failed_codes),
+            time.perf_counter() - t_load,
+        )
 
     if (
         sampling_check_enabled
         and staged_local_for_sampling
         and not (continue_on_error and not result)
     ):
+        t_phase_b0 = time.perf_counter()
         if verbose:
-            print(
-                f"[在线抽样] 阶段 B 开始（阶段 A 已结束）：本批 "
-                f"{len(staged_local_for_sampling)} 只，将进行接口 B 按日快照校验。",
-                flush=True,
+            get_backtest_logger().info(
+                "[在线抽样] 阶段 B 开始（阶段 A 已结束）：本批 %s 只，将进行接口 B 按日快照校验。",
+                len(staged_local_for_sampling),
             )
         sampling_deadline = time.perf_counter() + float(sampling_check_timeout_s)
+        smp = get_debug_logger("sampling")
+        if smp.isEnabledFor(logging.DEBUG):
+            smp.debug(
+                "phase B start n_symbols=%s sample_points=%s timeout_s=%s",
+                len(staged_local_for_sampling),
+                sampling_check_points,
+                sampling_check_timeout_s,
+            )
         batch_online_sample_check_daily_th_cross_section(
             staged_local_for_sampling,
             key=key,
@@ -137,6 +262,16 @@ def get_multiple_stock_data(
             adjust=str(adjust),
             ty=str(ty),
         )
+        log_performance_event(
+            "data/orchestration/batch_symbols.py",
+            kind="批量行情",
+            step="阶段 B 结束：按抽样交易日拉全日快照并与本地 OHLCV 对账",
+            code="data/storage/bar_store.py:batch_online_sample_check_daily_th_cross_section",
+            elapsed_s=time.perf_counter() - t_phase_b0,
+            metrics=f"symbols={len(staged_local_for_sampling)}",
+        )
+        if smp.isEnabledFor(logging.DEBUG):
+            smp.debug("phase B finished")
 
     if continue_on_error and failed_codes:
         fail_log = cache_dir / "smart_merge_failed_codes.txt"

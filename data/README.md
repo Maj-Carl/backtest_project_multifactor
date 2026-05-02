@@ -30,9 +30,9 @@ data/
   universe/                       # 股票池
     builder.py
     build_a_share_universe.py      # CLI：刷新全 A 代码表 → a_share_codes.csv
-    build_manual_universe_from_all.py # CLI：从全 A CSV 生成手动池模板
-    a_share_codes.csv
-    manual_universe_template.csv
+    build_manual_universe_from_all.py # CLI：从全 A 筛出示例 CSV；可直接 --target a_share_codes.csv
+    a_share_codes.csv                 # 唯一持久化股票池缓存（自动或 --manual-csv 写入）
+    manual_universe_example.csv       # 示例输出（默认不用于回测，除非 --manual-csv 指向它）
 ```
 
 ## 股票池命令行（`data/universe/`）

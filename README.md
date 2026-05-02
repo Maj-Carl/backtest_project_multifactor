@@ -22,7 +22,7 @@
 
 根目录建议仅保留入口与模块目录：
 
-- `run_multifactor.py`：主入口（支持全量与冒烟）
+- `run_multifactor.py`：主入口（全量 / 冒烟 / `--manual-csv` 自定义股票池）
 - `backtest_main.py`：回测主流程编排
 - `config/`：全局配置
 - `data/`：数据获取、行情仓与股票池构建
@@ -42,6 +42,9 @@
   - `python run_multifactor.py --smoke`
 - 超小冒烟（更快）
   - `python run_multifactor.py --smoke --smoke-topk 3 --smoke-days 20`
+- 调试模式（分类 DEBUG 日志写入 `logs/debug/*.log`）
+  - `python run_multifactor.py --debug`（可与 `--smoke` 等组合）
+- 主流程终端输出与 `logs/backtest.log` 一致（同一 logger：股票池提示、行情装载、在线抽样、接口重试、回测摘要等）；交易明细仍在 `logs/trading.log`，性能节点在 `logs/performance.log`。
 
 ## 数据接口调试（data/fetch/apis）
 
@@ -57,8 +60,11 @@
 
 ## 股票池与数据辅助（`data/universe/`、`data/fetch/apis`）
 
-- 生成全 A 股票清单：`python data/universe/build_a_share_universe.py`
-- 从全 A 生成手动池模板：`python data/universe/build_manual_universe_from_all.py`
+持久化股票池文件为 **`data/universe/a_share_codes.csv`**（自动抓取或手动 CSV 规范化后写入）。
+
+- 联网刷新清单并写缓存：`python run_multifactor.py --refresh-universe`（或 `python data/universe/build_a_share_universe.py`）
+- 本次回测使用自定义 CSV（写入 `a_share_codes.csv` 后再按 `Config` 过滤）：`python run_multifactor.py --manual-csv path/to/codes.csv`
+- 从全 A 清单筛出示例 CSV：`python data/universe/build_manual_universe_from_all.py`（默认输出 `manual_universe_example.csv`；若要直接覆盖股票池文件可用 `--target data/universe/a_share_codes.csv`）
 - 接口调试（含接口 B 单日全市预览）：见上文「数据接口调试」
 
 说明：原 `scripts/` 下预抓取、catalog 查看、手工对账、`daily_th` 补仓、参数扫描等 CLI 已从本仓库移除；需要时可从 Git 历史恢复。

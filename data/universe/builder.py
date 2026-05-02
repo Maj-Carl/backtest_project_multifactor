@@ -7,6 +7,9 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from utils.logger import get_debug_logger
+
+# 回测使用的股票池清单默认读写此文件（与 Config 无第二套路径）。
 UNIVERSE_CACHE_FILE = Path(__file__).resolve().parent / "a_share_codes.csv"
 EASTMONEY_API = "https://push2.eastmoney.com/api/qt/clist/get"
 FALLBACK_CODES = [
@@ -114,6 +117,15 @@ def build_universe_codes(
     use_local=True,
     manual_csv_path=None,
 ):
+    """manual_csv_path 仅适用于 ``run_multifactor.py --manual-csv``；勿在 Config 中配置隐式路径。"""
+    du = get_debug_logger("universe")
+    du.debug(
+        "build_universe_codes enter prefixes=%s top_k=%s use_local=%s manual_csv_path=%s",
+        prefixes,
+        top_k,
+        use_local,
+        manual_csv_path,
+    )
     UNIVERSE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     manual_path = Path(manual_csv_path) if manual_csv_path else None
@@ -183,4 +195,6 @@ def build_universe_codes(
     df = df.sort_values(by=["amount", "turnover"], ascending=False)
     if top_k:
         df = df.head(top_k)
-    return df["code"].tolist()
+    codes = df["code"].tolist()
+    du.debug("build_universe_codes exit n=%s sample=%s", len(codes), codes[:12])
+    return codes

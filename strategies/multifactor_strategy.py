@@ -3,7 +3,7 @@ import math
 
 import backtrader as bt
 
-from utils.logger import setup_logger, get_trade_logger
+from utils.logger import get_backtest_logger, get_trade_logger
 
 
 class MultiFactorPandasData(bt.feeds.PandasData):
@@ -30,10 +30,61 @@ class PriceVolumeMultiFactorStrategy(bt.Strategy):
     )
 
     def __init__(self):
-        self.logger = setup_logger(self.__class__.__name__)
+        self.logger = get_backtest_logger()
         self.trade_logger = get_trade_logger()
         self.hold_days = {}
         self.last_rebalance_bar = -9999
+
+    def _trade_log_date(self) -> str:
+        try:
+            return self.datetime.date(0).isoformat()
+        except Exception:
+            return ""
+
+    def notify_order(self, order):
+        """每笔委托状态变化写入 trading.log（与终端无关，专供对账/分析）。"""
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        dt = self._trade_log_date()
+        sym = getattr(order.data, "_name", "") if order.data is not None else ""
+        if order.status == order.Completed:
+            side = "BUY" if order.isbuy() else "SELL"
+            ex = order.executed
+            self.trade_logger.info(
+                "ORDER_COMPLETED,%s,%s,%s,ref=%s,size=%s,price=%.4f,value=%.4f,comm=%.4f",
+                dt,
+                sym,
+                side,
+                order.ref,
+                ex.size,
+                ex.price,
+                ex.value,
+                ex.comm,
+            )
+        else:
+            self.trade_logger.info(
+                "ORDER_END,%s,%s,ref=%s,status=%s,req_size=%s",
+                dt,
+                sym,
+                order.ref,
+                order.getstatusname(),
+                order.size,
+            )
+
+    def notify_trade(self, trade):
+        """单标的仓位从开到平的一次汇总（平仓时写 trading.log）。"""
+        if not trade.isclosed:
+            return
+        dt = self._trade_log_date()
+        self.trade_logger.info(
+            "TRADE_CLOSED,%s,%s,pnl=%.4f,pnlcomm=%.4f,commission=%.4f,barlen=%s",
+            dt,
+            trade.getdataname(),
+            trade.pnl,
+            trade.pnlcomm,
+            trade.commission,
+            trade.barlen,
+        )
 
     @staticmethod
     def _zscore_map(raw_map):
@@ -137,10 +188,17 @@ class PriceVolumeMultiFactorStrategy(bt.Strategy):
                 continue
             if data not in target_set and self.hold_days.get(data, 0) >= self.p.min_hold_days:
                 self.order_target_percent(data=data, target=0.0)
-                self.trade_logger.info("多因子卖出,%s,score_out", data._name)
+                self.trade_logger.info(
+                    "多因子卖出,%s,%s,score_out", self._trade_log_date(), data._name
+                )
 
         for data in target_datas:
             self.order_target_percent(data=data, target=target_pct)
-            self.trade_logger.info("多因子调仓,%s,target=%.3f", data._name, target_pct)
+            self.trade_logger.info(
+                "多因子调仓,%s,%s,target=%.3f",
+                self._trade_log_date(),
+                data._name,
+                target_pct,
+            )
 
         self.last_rebalance_bar = len(self)

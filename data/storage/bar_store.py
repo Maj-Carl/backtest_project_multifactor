@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import random
 import time
@@ -21,6 +22,12 @@ from data.fetch.apis.api_kline_daily_th import fetch_daily_th_bars_for_code, fet
 from data.fetch.apis.api_kline_dc import fetch_kline_dc_nonempty_payload
 from data.fetch.trade_calendar import get_trade_days
 from data.storage.column_normalize import normalize_legacy_columns
+from utils.logger import get_backtest_logger, get_debug_logger
+
+
+def _run_info(msg: str, *, verbose: bool = True) -> None:
+    if verbose:
+        get_backtest_logger().info(msg)
 
 try:
     import duckdb
@@ -121,6 +128,11 @@ def _log_ingest_run(
     message: str,
     rows_after: int,
 ):
+    """写入 ``ingest_runs`` 审计行。
+
+    仅在已写 silver 并更新 ``bar_catalog`` 后由调用方触发：``load_or_update_bars``、
+    ``upsert_daily_th_snapshot_into_silver``。
+    """
     if duckdb is None:
         return
     _ensure_catalog(cache_dir)
@@ -170,6 +182,80 @@ def _release_symbol_lock(lock_path: Optional[Path]):
         pass
 
 
+# 阶段 A（get_multiple_stock_data 内逐只 load_or_update_bars）分项累计秒数，供 performance.log 拆解。
+_PHASE_A_MICRO: Dict[str, float] = {
+    "read_s": 0.0,
+    "gaps_s": 0.0,
+    "fetch_s": 0.0,
+    "persist_s": 0.0,
+    "lock_s": 0.0,
+    "merge_s": 0.0,
+    "dedupe_s": 0.0,
+    "log_s": 0.0,
+    "other_s": 0.0,
+    "symbols": 0.0,
+}
+
+
+def reset_phase_a_microtimings() -> None:
+    """在批量装载开始前清零（由 ``batch_symbols.get_multiple_stock_data`` 调用）。"""
+    global _PHASE_A_MICRO
+    _PHASE_A_MICRO = {
+        "read_s": 0.0,
+        "gaps_s": 0.0,
+        "fetch_s": 0.0,
+        "persist_s": 0.0,
+        "lock_s": 0.0,
+        "merge_s": 0.0,
+        "dedupe_s": 0.0,
+        "log_s": 0.0,
+        "other_s": 0.0,
+        "symbols": 0.0,
+    }
+
+
+def take_phase_a_microtimings() -> Dict[str, float]:
+    """取出累计值并清零，供阶段 A 结束后写性能日志。"""
+    global _PHASE_A_MICRO
+    out = dict(_PHASE_A_MICRO)
+    reset_phase_a_microtimings()
+    return out
+
+
+def _record_phase_a_symbol_timings(
+    read_s: float,
+    gaps_s: float,
+    fetch_s: float,
+    persist_s: float,
+    lock_s: float,
+    merge_s: float,
+    dedupe_s: float,
+    log_s: float,
+    wall_s: float,
+) -> None:
+    parts = (
+        read_s
+        + gaps_s
+        + fetch_s
+        + persist_s
+        + lock_s
+        + merge_s
+        + dedupe_s
+        + log_s
+    )
+    other = max(0.0, wall_s - parts)
+    _PHASE_A_MICRO["read_s"] += read_s
+    _PHASE_A_MICRO["gaps_s"] += gaps_s
+    _PHASE_A_MICRO["fetch_s"] += fetch_s
+    _PHASE_A_MICRO["persist_s"] += persist_s
+    _PHASE_A_MICRO["lock_s"] += lock_s
+    _PHASE_A_MICRO["merge_s"] += merge_s
+    _PHASE_A_MICRO["dedupe_s"] += dedupe_s
+    _PHASE_A_MICRO["log_s"] += log_s
+    _PHASE_A_MICRO["other_s"] += other
+    _PHASE_A_MICRO["symbols"] += 1.0
+
+
 def _read_bars_parquet(path: Path) -> pd.DataFrame:
     df = pd.read_parquet(path)
     if "date" not in df.columns:
@@ -211,7 +297,9 @@ def _fetch_slice_remote(
 ) -> pd.DataFrame:
     if period == "1d" and ty == "个股":
         if verbose:
-            print(f"[{_normalize_symbol(code)}] 使用 daily_th 补缺 {start_date}~{end_date}")
+            _run_info(
+                f"[{_normalize_symbol(code)}] 使用 daily_th 补缺 {start_date}~{end_date}"
+            )
         df = fetch_daily_th_bars_for_code(
             _normalize_symbol(code),
             start_date,
@@ -314,12 +402,27 @@ def load_or_update_bars(
     merged: Optional[pd.DataFrame] = None
 
     try:
+        t_wall0 = time.perf_counter()
+        dt_read = 0.0
+        dt_gaps = 0.0
+        dt_fetch = 0.0
+        dt_persist = 0.0
+        dt_lock = 0.0
+        dt_merge = 0.0
+        dt_dedupe = 0.0
+        dt_log = 0.0
+        merged_remote_rows = False
+
+        t0 = time.perf_counter()
         lock_path = _acquire_symbol_lock(cache_dir, code_z, period, storage_adjust, ty)
+        dt_lock = time.perf_counter() - t0
 
         if use_local and canon.exists():
+            t0 = time.perf_counter()
             merged = _read_bars_parquet(canon)
             if "code" in merged.columns:
                 merged = merged[merged["code"].astype(str).map(_normalize_symbol) == code_z]
+            dt_read = time.perf_counter() - t0
 
         api_key = _ensure_api_key(key)
 
@@ -348,16 +451,47 @@ def load_or_update_bars(
             segs.append((seg_start, prev))
             return segs
 
+        t0 = time.perf_counter()
         segments = need_fetch_segments(merged)
-        merged_remote_rows = False
+        dt_gaps = time.perf_counter() - t0
         calendar_had_gaps = bool(segments)
 
+        dbg = get_debug_logger("bars")
+        if dbg.isEnabledFor(logging.DEBUG):
+            seg_preview = [
+                (str(a.date()), str(b.date())) for a, b in segments[:8]
+            ]
+            dbg.debug(
+                "load_or_update_bars code=%s canon_exists=%s use_local=%s n_segments=%s "
+                "range=%s~%s seg_preview=%s",
+                code_z,
+                canon.exists(),
+                use_local,
+                len(segments),
+                start_date,
+                end_date,
+                seg_preview,
+            )
+
         fetch_verbose = bool(verbose and log_each_symbol)
-        for seg_start, seg_end in segments:
+        for si, (seg_start, seg_end) in enumerate(segments):
             if seg_start > seg_end:
                 continue
+            if dbg.isEnabledFor(logging.DEBUG):
+                dbg.debug(
+                    "segment %s/%s code=%s %s~%s",
+                    si + 1,
+                    len(segments),
+                    code_z,
+                    seg_start.date(),
+                    seg_end.date(),
+                )
             if fetch_verbose:
-                print(f"[{code_z}] 向接口补缺: {seg_start.date()} ~ {seg_end.date()}")
+                _run_info(
+                    f"[{code_z}] 向接口补缺: {seg_start.date()} ~ {seg_end.date()}",
+                    verbose=True,
+                )
+            t0 = time.perf_counter()
             chunk = _fetch_slice_remote(
                 code_z,
                 seg_start.strftime("%Y-%m-%d"),
@@ -368,39 +502,46 @@ def load_or_update_bars(
                 ty,
                 fetch_verbose,
             )
+            dt_fetch += time.perf_counter() - t0
             if chunk.empty:
                 continue
             merged_remote_rows = True
+            t1 = time.perf_counter()
             if merged is None:
                 merged = chunk
             else:
                 merged = pd.concat([merged, chunk], ignore_index=True)
+            dt_merge += time.perf_counter() - t1
 
         if merged is None or merged.empty:
             raise ValueError(f"[{code_z}] 无本地数据且接口未返回数据。")
 
+        t0 = time.perf_counter()
         merged = merged.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+        dt_dedupe += time.perf_counter() - t0
         if merged_remote_rows:
+            t0 = time.perf_counter()
             tmp_path = canon.with_suffix(".parquet.tmp")
             merged.to_parquet(tmp_path, index=False)
             os.replace(tmp_path, canon)
             _update_catalog(cache_dir, code_z, period, storage_adjust, ty, canon, merged)
+            dt_persist = time.perf_counter() - t0
             if verbose and log_each_symbol:
-                print(
+                _run_info(
                     f"[{code_z}] 已写入本地档案（接口补缺并入）: {canon} "
                     f"（全表 {len(merged)} 行）"
                 )
             ingest_msg = "persist_remote_merge"
         elif not calendar_had_gaps:
             if verbose and log_each_symbol:
-                print(
+                _run_info(
                     f"[{code_z}] 请求区间内交易日已齐备，沿用本地档案，未写入磁盘 "
                     f"（全表 {len(merged)} 行）"
                 )
             ingest_msg = "skip_write_no_calendar_gap"
         else:
             if verbose and log_each_symbol:
-                print(
+                _run_info(
                     f"[{code_z}] 已请求接口补缺但未获得有效行，未写入磁盘 "
                     f"（全表 {len(merged)} 行）"
                 )
@@ -411,37 +552,63 @@ def load_or_update_bars(
                 {"code": code_z, "ingest_message": ingest_msg, "merged_rows": int(len(merged))}
             )
 
+        if dbg.isEnabledFor(logging.DEBUG):
+            dbg.debug(
+                "load_or_update_bars done code=%s ingest=%s merged_rows=%s",
+                code_z,
+                ingest_msg,
+                len(merged),
+            )
+
+        t0 = time.perf_counter()
         out = merged[(merged["date"] >= req_start) & (merged["date"] <= req_end)].copy()
+        dt_dedupe += time.perf_counter() - t0
+
         if out.empty:
             raise ValueError(f"[{code_z}] 合并后仍无数据落在请求区间 {start_date}~{end_date}。")
-        _log_ingest_run(
-            cache_dir,
-            run_id=run_id,
-            code=code_z,
-            period=period,
-            adjust=storage_adjust,
-            ty=ty,
-            request_start=start_date,
-            request_end=end_date,
-            status="success",
-            message=ingest_msg,
-            rows_after=len(merged),
+        if merged_remote_rows:
+            t0 = time.perf_counter()
+            _log_ingest_run(
+                cache_dir,
+                run_id=run_id,
+                code=code_z,
+                period=period,
+                adjust=storage_adjust,
+                ty=ty,
+                request_start=start_date,
+                request_end=end_date,
+                status="success",
+                message=ingest_msg,
+                rows_after=len(merged),
+            )
+            dt_log += time.perf_counter() - t0
+        _record_phase_a_symbol_timings(
+            dt_read,
+            dt_gaps,
+            dt_fetch,
+            dt_persist,
+            dt_lock,
+            dt_merge,
+            dt_dedupe,
+            dt_log,
+            time.perf_counter() - t_wall0,
         )
         return _apply_adjust_to_ohlc(out, requested_adjust)
     except Exception as exc:
-        _log_ingest_run(
-            cache_dir,
-            run_id=run_id,
-            code=code_z,
-            period=period,
-            adjust=storage_adjust,
-            ty=ty,
-            request_start=start_date,
-            request_end=end_date,
-            status="failed",
-            message=str(exc),
-            rows_after=len(merged) if merged is not None else 0,
-        )
+        if merged_remote_rows:
+            _log_ingest_run(
+                cache_dir,
+                run_id=run_id,
+                code=code_z,
+                period=period,
+                adjust=storage_adjust,
+                ty=ty,
+                request_start=start_date,
+                request_end=end_date,
+                status="failed",
+                message=str(exc),
+                rows_after=len(merged) if merged is not None else 0,
+            )
         raise
     finally:
         _release_symbol_lock(lock_path)
@@ -515,10 +682,25 @@ def upsert_daily_th_snapshot_into_silver(
             os.replace(tmp_path, canon)
             _update_catalog(cache_dir, code_z, period, adjust, ty, canon, combined)
             counts["merged_files"] += 1
+            _dmin = pd.to_datetime(combined["date"]).min()
+            _dmax = pd.to_datetime(combined["date"]).max()
+            _log_ingest_run(
+                cache_dir,
+                run_id=uuid.uuid4().hex,
+                code=code_z,
+                period=period,
+                adjust=adjust,
+                ty=ty,
+                request_start=_dmin.strftime("%Y-%m-%d"),
+                request_end=_dmax.strftime("%Y-%m-%d"),
+                status="success",
+                message="upsert_daily_th_snapshot_into_silver",
+                rows_after=int(len(combined)),
+            )
         except Exception as exc:
             counts["failures"] += 1
             if verbose:
-                print(f"[{code_z}] daily_th 写入失败: {exc}")
+                _run_info(f"[{code_z}] daily_th 写入失败: {exc}")
         finally:
             _release_symbol_lock(lock_path)
 
@@ -660,20 +842,20 @@ def batch_online_sample_check_daily_th_cross_section(
     if period != "1d" or ty != "个股":
         skipped["reason"] = "当前在线抽样仅支持 period=1d 且 ty=个股（接口 B）。"
         if verbose:
-            print(f"[在线抽样] {skipped['reason']}", flush=True)
+            _run_info(f"[在线抽样] {skipped['reason']}")
         return skipped
 
     aj = str(adjust)
     if aj not in ("0", "1", "2"):
         skipped["reason"] = f"不支持的 adjust={adjust!r}，抽样跳过。"
         if verbose:
-            print(f"[在线抽样] {skipped['reason']}", flush=True)
+            _run_info(f"[在线抽样] {skipped['reason']}")
         return skipped
 
     if not code_to_loaded_df:
         skipped["reason"] = "无一只有效本地 DataFrame。"
         if verbose:
-            print(f"[在线抽样] {skipped['reason']}", flush=True)
+            _run_info(f"[在线抽样] {skipped['reason']}")
         return skipped
 
     sorted_dates = _union_sorted_dates_from_loaded(code_to_loaded_df)
@@ -681,14 +863,13 @@ def batch_online_sample_check_daily_th_cross_section(
     if not sample_dates:
         skipped["reason"] = "并集日历为空。"
         if verbose:
-            print(f"[在线抽样] {skipped['reason']}", flush=True)
+            _run_info(f"[在线抽样] {skipped['reason']}")
         return skipped
 
     if verbose:
-        print(
+        _run_info(
             f"[在线抽样] 抽样种子 seed={int(seed)}"
-            "（对应 pick_sample_trade_dates_union 内 Random(seed+7919)，见 Config.DATA_SAMPLING_CHECK_SEED）",
-            flush=True,
+            "（对应 pick_sample_trade_dates_union 内 Random(seed+7919)，见 Config.DATA_SAMPLING_CHECK_SEED）"
         )
 
     try:
@@ -696,7 +877,7 @@ def batch_online_sample_check_daily_th_cross_section(
     except ValueError as exc:
         skipped["reason"] = str(exc)
         if verbose:
-            print(f"[在线抽样] {skipped['reason']}，跳过阶段 B。", flush=True)
+            _run_info(f"[在线抽样] {skipped['reason']}，跳过阶段 B。")
         return skipped
 
     probe_ds = sample_dates[0]
@@ -717,7 +898,7 @@ def batch_online_sample_check_daily_th_cross_section(
     except (ValueError, requests.RequestException, OSError, KeyError) as exc:
         skipped["reason"] = f"按日探针失败（{exc}），阶段 B 整段跳过"
         if verbose:
-            print(f"[在线抽样] {skipped['reason']}", flush=True)
+            _run_info(f"[在线抽样] {skipped['reason']}")
         skipped["sample_dates"] = sample_dates[:1]
         return skipped
 
@@ -779,7 +960,7 @@ def batch_online_sample_check_daily_th_cross_section(
             if strict:
                 raise RuntimeError(f"[在线抽样] 日期 {ds} 拉取全日快照失败: {exc}") from exc
             if verbose:
-                print(f"[在线抽样] 跳过日期 {ds}（拉取失败: {exc}）", flush=True)
+                _run_info(f"[在线抽样] 跳过日期 {ds}（拉取失败: {exc}）")
             continue
 
         completed_sample_dates.append(ds)
@@ -805,7 +986,7 @@ def batch_online_sample_check_daily_th_cross_section(
                 if strict:
                     raise RuntimeError(msg) from None
                 if verbose:
-                    print(msg, flush=True)
+                    _run_info(msg)
                 continue
 
             if isinstance(row_r, pd.DataFrame):
@@ -822,7 +1003,7 @@ def batch_online_sample_check_daily_th_cross_section(
                 if strict:
                     raise RuntimeError(msg) from exc
                 if verbose:
-                    print(msg + "（已跳过该组合）", flush=True)
+                    _run_info(msg + "（已跳过该组合）")
                 continue
 
             mm = _cross_section_ohlcv_mismatches(
@@ -833,11 +1014,7 @@ def batch_online_sample_check_daily_th_cross_section(
                 for m in mm:
                     mismatches_agg.append({"date": ds, "code": code_z, **m})
                 if verbose:
-                    print(
-                        f"[在线抽样校验失败] {ds} {code_z} 例: "
-                        f"{mm[:2]}",
-                        flush=True,
-                    )
+                    _run_info(f"[在线抽样校验失败] {ds} {code_z} 例: {mm[:2]}")
                 if strict:
                     raise RuntimeError(
                         f"[在线抽样校验失败] date={ds} code={code_z} "
@@ -852,10 +1029,9 @@ def batch_online_sample_check_daily_th_cross_section(
             timeout_note = f"（计划 {planned_n} 天，因 wall clock 上限仅拉取并完成 {done_n} 天）"
         else:
             timeout_note = ""
-        print(
+        _run_info(
             f"[在线抽样] 已抽样检查 {done_n} 天{timeout_note}，"
-            f"共计 {total_checked} 个数据点（标的×抽样日），抽样日：{dates_joined}",
-            flush=True,
+            f"共计 {total_checked} 个数据点（标的×抽样日），抽样日：{dates_joined}"
         )
 
     return {
@@ -935,9 +1111,11 @@ def compare_local_vs_remote(
     ok = len(mismatches) == 0
     sample = mismatches[:10]
     if verbose:
-        print(f"校验 {code_z} {start_date}~{end_date}: 重叠 {len(common)} 日, 不一致 {len(mismatches)} 处")
+        _run_info(
+            f"校验 {code_z} {start_date}~{end_date}: 重叠 {len(common)} 日, 不一致 {len(mismatches)} 处"
+        )
         if sample:
-            print("示例:", sample[:3])
+            _run_info(f"示例: {sample[:3]}")
     return {
         "ok": ok,
         "overlap_days": len(common),

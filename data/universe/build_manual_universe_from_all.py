@@ -13,7 +13,11 @@ if str(PROJECT_ROOT) not in sys.path:
 def main():
     parser = argparse.ArgumentParser(description="从全A股票池生成手动策略股票池。")
     parser.add_argument("--source", default="data/universe/a_share_codes.csv", help="全A股票池CSV路径")
-    parser.add_argument("--target", default="data/universe/manual_universe_template.csv", help="输出手动股票池CSV路径")
+    parser.add_argument(
+        "--target",
+        default="data/universe/manual_universe_example.csv",
+        help="输出 CSV 路径；若需直接作为回测股票池，请改为 data/universe/a_share_codes.csv",
+    )
     parser.add_argument("--prefixes", default="60,00", help="保留代码前缀，逗号分隔，例如 60,00,30")
     parser.add_argument("--topk", type=int, default=300, help="输出数量上限，<=0 表示不限制")
     parser.add_argument("--keep-st", action="store_true", help="保留ST股票（默认剔除）")

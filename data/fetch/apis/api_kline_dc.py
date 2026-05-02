@@ -9,6 +9,8 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from utils.logger import get_backtest_logger
+
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -46,11 +48,15 @@ def fetch_kline_dc_payload(payload: dict, *, verbose: bool = True, max_retries: 
         except requests.exceptions.Timeout as exc:
             last_error = exc
             if verbose:
-                print(f"[api_kline_dc] 请求超时，重试中 ({attempt}/{max_retries})...")
+                get_backtest_logger().info(
+                    "[api_kline_dc] 请求超时，重试中 (%s/%s)...", attempt, max_retries
+                )
         except requests.exceptions.RequestException as exc:
             last_error = exc
             if verbose:
-                print(f"[api_kline_dc] 请求失败，重试中 ({attempt}/{max_retries})...")
+                get_backtest_logger().info(
+                    "[api_kline_dc] 请求失败，重试中 (%s/%s)...", attempt, max_retries
+                )
 
     if data is None:
         raise ConnectionError(f"获取股票数据失败: {last_error}")

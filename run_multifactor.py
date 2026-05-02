@@ -1,10 +1,28 @@
 """多因子策略命令行入口，支持全量与本地冒烟两种模式。"""
 import argparse
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from backtest_main import main
 from config.config import Config
-from data.universe.builder import build_universe_codes, UNIVERSE_CACHE_FILE
+from utils.logger import bootstrap_application_logging, get_backtest_logger
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _resolve_manual_csv(path_str: str) -> Path:
+    """支持绝对路径，或以项目根目录为基准的相对路径。"""
+    p = Path(path_str)
+    if p.is_absolute():
+        return p.resolve()
+    cand = (_PROJECT_ROOT / p).resolve()
+    if cand.exists():
+        return cand
+    cwd_cand = (Path.cwd() / p).resolve()
+    if cwd_cand.exists():
+        return cwd_cand
+    return cand
 
 
 SMOKE_TOPK_CAP = 5
@@ -23,32 +41,19 @@ def _apply_smoke_mode(smoke_topk: int = SMOKE_TOPK_CAP, smoke_days: int = SMOKE_
             Config.DEFAULT_START_DATE = narrowed_start.strftime("%Y-%m-%d")
     except ValueError:
         pass
-    print(
+    log = get_backtest_logger()
+    log.info(
         "[冒烟模式] SMOKE_TEST=ON（保留在线抽样与报告生成），"
-        f"UNIVERSE_TOPK≤{Config.UNIVERSE_TOPK}，日期窗约 {max(5, int(smoke_days))} 天至 END_DATE。"
+        "UNIVERSE_TOPK≤%s，日期窗约 %s 天至 END_DATE。",
+        Config.UNIVERSE_TOPK,
+        max(5, int(smoke_days)),
     )
-    print(
-        f"  区间: {Config.DEFAULT_START_DATE} ~ {Config.DEFAULT_END_DATE}"
-    )
+    log.info("  区间: %s ~ %s", Config.DEFAULT_START_DATE, Config.DEFAULT_END_DATE)
 
 
-def run(refresh_universe=False):
+def run(refresh_universe=False, manual_csv_path=None):
     Config.STRATEGY_NAME = "PriceVolumeMultiFactorStrategy"
-    if refresh_universe:
-        codes = build_universe_codes(
-            prefixes=Config.UNIVERSE_PREFIX,
-            top_k=Config.UNIVERSE_TOPK,
-            min_amount=Config.UNIVERSE_MIN_AMOUNT,
-            min_turnover=Config.UNIVERSE_MIN_TURNOVER,
-            use_local=False,
-            manual_csv_path=Config.UNIVERSE_MANUAL_CSV_PATH or None,
-        )
-        print(f"股票池已刷新: {len(codes)} 只")
-    else:
-        print(f"股票池缓存文件: {UNIVERSE_CACHE_FILE}")
-        print("默认使用本地缓存，不存在时才抓取。")
-
-    main()
+    main(manual_csv_path=manual_csv_path, refresh_universe=refresh_universe)
 
 
 if __name__ == "__main__":
@@ -75,7 +80,36 @@ if __name__ == "__main__":
         default=SMOKE_CALENDAR_DAYS,
         help=f"冒烟回测日历天数（默认 {SMOKE_CALENDAR_DAYS}）",
     )
+    parser.add_argument(
+        "--manual-csv",
+        metavar="PATH",
+        default=None,
+        help="使用指定 CSV 作为本次股票池来源（写入 a_share_codes.csv 后再按 Config 过滤）；"
+        "不设此项则仅使用缓存或在线构建",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="调试模式：分类 DEBUG 日志写入 logs/debug/*.log（与控制台无关）",
+    )
+    parser.add_argument(
+        "--perf-cprofile",
+        action="store_true",
+        help="对 cerebro.run 启用 cProfile，结果写入 logs/perf_cprofile_run.txt（可能较大）",
+    )
     args = parser.parse_args()
+    if getattr(args, "perf_cprofile", False):
+        Config.PERF_CPROFILE = True
+    if getattr(args, "debug", False):
+        Config.DEBUG_MODE = True
+    bootstrap_application_logging(debug_mode=getattr(Config, "DEBUG_MODE", False))
+    manual_csv = None
+    if getattr(args, "manual_csv", None):
+        resolved = _resolve_manual_csv(args.manual_csv)
+        if not resolved.is_file():
+            get_backtest_logger().error("找不到手动股票池文件: %s", resolved)
+            sys.exit(2)
+        manual_csv = str(resolved)
     if getattr(args, "smoke", False):
         _apply_smoke_mode(smoke_topk=args.smoke_topk, smoke_days=args.smoke_days)
-    run(refresh_universe=args.refresh_universe)
+    run(refresh_universe=args.refresh_universe, manual_csv_path=manual_csv)

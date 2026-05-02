@@ -45,7 +45,8 @@ class Config:
     UNIVERSE_MIN_AMOUNT = 100000000
     UNIVERSE_MIN_TURNOVER = 0.5
     UNIVERSE_USE_LOCAL = True
-    UNIVERSE_MANUAL_CSV_PATH = "data/universe/manual_universe_template.csv"
+    # 股票池唯一持久化文件见 data/universe/a_share_codes.csv。
+    # 自定义清单：`python run_multifactor.py --manual-csv <路径>`，或将脚本输出直接写入 a_share_codes.csv。
     MULTI_STOCK_CACHE_DIR = r"C:\投资\STOCK_DATA"
     BENCHMARK_SYMBOL = "1.000300"
     # 基准（指数）数据源固定使用接口A(api_stock_kline_dc)。
@@ -58,6 +59,13 @@ class Config:
 
     # 本地冒烟：`python run_multifactor.py --smoke` 会运行时置 True，勿手改日常使用
     SMOKE_TEST = False
+    # 调试：`python run_multifactor.py --debug` 会置 True；分类日志写入 logs/debug/*.log
+    DEBUG_MODE = False
+
+    # 性能诊断（写入 logs/performance.log；依赖 psutil 记录 RSS）
+    PERF_MEMORY_SNAPSHOT = True
+    # 为 True 时对 cerebro.run 做 cProfile，结果写入 logs/perf_cprofile_run.txt（体量可能较大）
+    PERF_CPROFILE = False
 
     # 文件路径
     DATA_DIR = "data"
