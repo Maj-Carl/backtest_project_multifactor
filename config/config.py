@@ -21,27 +21,54 @@ class Config:
     # 2 = bwd（后复权）：历史价格按当期因子累计；适合长期序列连续性分析与历史价格形态观察。
     DEFAULT_ADJUST = "0"
     DATA_IS_UNADJUSTED = True
+    # 回测主链路（个股 + 基准）使用的复权口径；多因子动量/波动建议前复权 "1"
+    BACKTEST_ADJUST = "1"
+
+    # 截面因子：分位去极值 + 对 log_size 中性 + z-score
+    FACTOR_WINSOR_LOW = 0.01
+    FACTOR_WINSOR_HIGH = 0.99
+    FACTOR_CS_MIN_NAMES = 40
+    FACTOR_IC_REPORT = True
+    # 全市场截面：用日度 Rank IC 在全样本（或前缀区间）上的 mean_ic 符号，对策略里对应 w_* 做取反，使打分方向与未来收益正相关
+    FACTOR_IC_ALIGN_WEIGHTS = True
+    # 仅用前 ratio 个交易日的 IC 序列估 mean_ic（<1 时减轻「用整段未来估权」的偷看；=1 与 IC 报告全样本一致）
+    FACTOR_IC_ALIGN_PREFIX_RATIO = 1.0
+    FACTOR_IC_ALIGN_MIN_DAYS = 40
+    FACTOR_IC_ALIGN_MIN_ABS_MEAN = 0.0
 
     # 策略配置：当前工程仅保留多因子策略
     STRATEGY_NAME = "PriceVolumeMultiFactorStrategy"
 
     STRATEGY_PARAMS = {
         "PriceVolumeMultiFactorStrategy": {
-            "holding_count": 5,
-            "rank_buffer": 2,
-            "score_delta": 0.20,
+            "holding_count": 12,
+            "rank_buffer": 3,
+            "score_delta": 0.22,
             "min_hold_days": 5,
             "rebalance_cooldown": 2,
-            "w_mom20": 0.35,
-            "w_mom60": 0.25,
-            "w_vol20": -0.20,
-            "w_liq20": 0.20,
+            "w_mom20": 0.24,
+            "w_mom60": 0.18,
+            "w_vol20": -0.26,
+            "w_liq20": 0.14,
+            "w_rev20": 0.10,
+            "w_dvol20": -0.12,
+            "w_amihud20": -0.10,
+            "weight_scheme": "exp_score",
+            "max_single_weight": 0.12,
+            "min_single_weight": 0.02,
+            "target_vol_enabled": True,
+            "target_vol_annual": 0.18,
+            "defense_enabled": True,
+            "defense_dd_trigger": 0.12,
+            "defense_gross_exposure": 0.58,
+            "defense_dd_deep": 0.22,
+            "defense_gross_exposure_deep": 0.38,
         },
     }
 
     # 多因子股票池配置
     UNIVERSE_PREFIX = ("60", "00")
-    UNIVERSE_TOPK = 3000
+    UNIVERSE_TOPK = 3500
     UNIVERSE_MIN_AMOUNT = 100000000
     UNIVERSE_MIN_TURNOVER = 0.5
     UNIVERSE_USE_LOCAL = True
@@ -57,8 +84,6 @@ class Config:
     DATA_SAMPLING_CHECK_STRICT = True
     DATA_SAMPLING_CHECK_TIMEOUT_S = 20.0
 
-    # 本地冒烟：`python run_multifactor.py --smoke` 会运行时置 True，勿手改日常使用
-    SMOKE_TEST = False
     # 调试：`python run_multifactor.py --debug` 会置 True；分类日志写入 logs/debug/*.log
     DEBUG_MODE = False
 

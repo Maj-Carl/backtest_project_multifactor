@@ -8,6 +8,14 @@ import requests
 # 自定义模块
 from data.orchestration.batch_symbols import get_multiple_stock_data
 from data.features.price_factors import add_factor_columns
+from data.factors.ic_report import (
+    align_strategy_weights_by_ic_summary,
+    build_ic_daily_from_multi,
+    ic_summary_from_daily,
+    maybe_write_factor_ic_report,
+    truncate_ic_daily_for_align,
+)
+from data.factors.panel import apply_cross_section_to_multi_data
 from data.orchestration.single_symbol import get_stock_data
 from data.universe.builder import build_universe_codes, UNIVERSE_CACHE_FILE
 import strategies as strategy_module
@@ -26,9 +34,12 @@ from utils.logger import (
 
 
 def get_multifactor_data_feeds(manual_csv_path=None):
-    """构建多因子策略所需的多标的 data feed 列表。
+    """构建多因子策略所需的多标的 data feed 列表，并可选返回用于 IC 符号对齐的摘要表。
 
     manual_csv_path: 仅由 ``run_multifactor.py --manual-csv`` 传入；规范化后会写入 a_share_codes.csv。
+
+    Returns:
+        (feeds, ic_align_summary): ic_align_summary 在关闭 FACTOR_IC_ALIGN_WEIGHTS 时为 None。
     """
     t_u0 = time.perf_counter()
     codes = build_universe_codes(
@@ -56,17 +67,18 @@ def get_multifactor_data_feeds(manual_csv_path=None):
     )
     logger.info("多因子股票池数量: %s", len(codes))
     t_b0 = time.perf_counter()
+    _adj = getattr(Config, "BACKTEST_ADJUST", Config.DEFAULT_ADJUST)
     multi_data = get_multiple_stock_data(
         codes=codes,
         period=Config.DEFAULT_PERIOD,
         start_date=Config.DEFAULT_START_DATE,
         end_date=Config.DEFAULT_END_DATE,
-        adjust=Config.DEFAULT_ADJUST,
+        adjust=_adj,
         ty='个股',
         use_local=True,
-        verbose=not getattr(Config, "SMOKE_TEST", False),
+        verbose=True,
         cache_dir_path=Config.MULTI_STOCK_CACHE_DIR,
-        continue_on_error=getattr(Config, "SMOKE_TEST", False),
+        continue_on_error=False,
         sampling_check_enabled=Config.DATA_SAMPLING_CHECK_ENABLED,
         sampling_check_points=Config.DATA_SAMPLING_CHECK_POINTS,
         sampling_check_seed=Config.DATA_SAMPLING_CHECK_SEED,
@@ -82,24 +94,51 @@ def get_multifactor_data_feeds(manual_csv_path=None):
         raise RuntimeError("未获取到任何多标的行情数据。")
 
     plog.debug("batch load done: n_symbols=%s", len(multi_data))
-    feeds = []
-    t_f0 = time.perf_counter()
+    with_factors = {}
     for code, df in multi_data.items():
         factor_df = add_factor_columns(df)
+        if not factor_df.empty:
+            with_factors[code] = factor_df
+    need_ic = getattr(Config, "FACTOR_IC_REPORT", False) or getattr(
+        Config, "FACTOR_IC_ALIGN_WEIGHTS", False
+    )
+    ic_daily = None
+    if need_ic:
+        ic_daily = build_ic_daily_from_multi(with_factors)
+    maybe_write_factor_ic_report(
+        with_factors,
+        Config.REPORTS_DIR,
+        enabled=getattr(Config, "FACTOR_IC_REPORT", False),
+        ic_daily_precomputed=ic_daily,
+    )
+    ic_align_summary = None
+    if getattr(Config, "FACTOR_IC_ALIGN_WEIGHTS", False) and ic_daily is not None and not ic_daily.empty:
+        ratio = float(getattr(Config, "FACTOR_IC_ALIGN_PREFIX_RATIO", 1.0))
+        sub = truncate_ic_daily_for_align(ic_daily, ratio)
+        ic_align_summary = ic_summary_from_daily(sub)
+    cs_data = apply_cross_section_to_multi_data(
+        with_factors,
+        winsor_low=getattr(Config, "FACTOR_WINSOR_LOW", 0.01),
+        winsor_high=getattr(Config, "FACTOR_WINSOR_HIGH", 0.99),
+        min_names_per_day=getattr(Config, "FACTOR_CS_MIN_NAMES", 40),
+    )
+    feeds = []
+    t_f0 = time.perf_counter()
+    for code, factor_df in cs_data.items():
         if factor_df.empty:
             continue
         feed = strategy_module.MultiFactorPandasData(dataname=factor_df, name=code)
         feeds.append(feed)
     _perf_data_sub(
         "计算因子列并构造 backtrader 数据源对象",
-        "data/features/price_factors.py:add_factor_columns → strategies.MultiFactorPandasData",
+        "data/features/price_factors.py + data/factors/panel.py → strategies.MultiFactorPandasData",
         t_f0,
     )
 
     if not feeds:
         raise RuntimeError("有效多标的 data feed 为空，请检查数据区间或股票池过滤条件。")
     plog.debug("feeds built: n=%s", len(feeds))
-    return feeds
+    return feeds, ic_align_summary
 
 
 def get_benchmark_data():
@@ -110,7 +149,7 @@ def get_benchmark_data():
             period=Config.DEFAULT_PERIOD,
             start_date=Config.DEFAULT_START_DATE,
             end_date=Config.DEFAULT_END_DATE,
-            adjust=Config.DEFAULT_ADJUST,
+            adjust=getattr(Config, "BACKTEST_ADJUST", Config.DEFAULT_ADJUST),
             ty='指数',
             use_local=True,
             verbose=False
@@ -197,8 +236,7 @@ def main(manual_csv_path=None, refresh_universe=False):
             logger.info("将用 --manual-csv 更新缓存后回测（见上）。")
 
         get_debug_logger("pipeline").debug(
-            "main start smoke=%s manual_csv_path=%s refresh_universe=%s",
-            getattr(Config, "SMOKE_TEST", False),
+            "main start manual_csv_path=%s refresh_universe=%s",
             manual_csv_path,
             refresh_universe,
         )
@@ -218,7 +256,7 @@ def main(manual_csv_path=None, refresh_universe=False):
             code="config/config.py:Config",
             metrics=(
                 f"python={sys.version.split()[0]} | platform={platform.platform()} | "
-                f"SMOKE_TEST={getattr(Config, 'SMOKE_TEST', False)} | UNIVERSE_TOPK={Config.UNIVERSE_TOPK} | "
+                f"UNIVERSE_TOPK={Config.UNIVERSE_TOPK} | "
                 f"区间={Config.DEFAULT_START_DATE}~{Config.DEFAULT_END_DATE} | "
                 f"MULTI_STOCK_CACHE_DIR={Config.MULTI_STOCK_CACHE_DIR}"
             ),
@@ -229,29 +267,40 @@ def main(manual_csv_path=None, refresh_universe=False):
         # 1. 初始化回测引擎
         engine = BacktestEngine()
 
-        # 2. 添加多因子策略
-        strategy_name = "PriceVolumeMultiFactorStrategy"
-        strategy_class = strategy_module.PriceVolumeMultiFactorStrategy
-        strategy_params = Config.get_strategy_params()
-        engine.add_strategy(
-            strategy_class,
-            **strategy_params,
-        )
-        logger.info(f"当前策略: {strategy_name}, 参数: {strategy_params}")
-        dt_engine, t = _perf_phase(
-            "创建回测引擎并注册多因子策略",
-            "backtest/backtest_engine.py:BacktestEngine + add_strategy → strategies.PriceVolumeMultiFactorStrategy",
-            t,
-        )
-
-        # 3. 多标的数据与 Feed
-        data_feeds = get_multifactor_data_feeds(manual_csv_path=manual_csv_path)
+        # 2. 多标的数据与 Feed（先于策略：全市场截面 IC 可对权重做符号对齐）
+        data_feeds, ic_align_summary = get_multifactor_data_feeds(manual_csv_path=manual_csv_path)
         dt_feeds, t = _perf_phase(
             "整段：股票池 + 批量行情 + 因子列 + Feed 列表（见数据子阶段明细）",
             "backtest_main.py:get_multifactor_data_feeds()",
             t,
         )
         perf_memory_note("数据管线完成后", proc="main()")
+
+        strategy_name = "PriceVolumeMultiFactorStrategy"
+        strategy_class = strategy_module.PriceVolumeMultiFactorStrategy
+        strategy_params = dict(Config.get_strategy_params())
+        if getattr(Config, "FACTOR_IC_ALIGN_WEIGHTS", False) and ic_align_summary is not None:
+            strategy_params, signs = align_strategy_weights_by_ic_summary(
+                strategy_params,
+                ic_align_summary,
+                min_days=int(getattr(Config, "FACTOR_IC_ALIGN_MIN_DAYS", 40)),
+                min_abs_mean=float(getattr(Config, "FACTOR_IC_ALIGN_MIN_ABS_MEAN", 0.0)),
+            )
+            if signs:
+                logger.info(
+                    "[因子IC对齐] 已按全市场截面 mean_ic 符号调整权重: %s | 完整参数: %s",
+                    signs,
+                    strategy_params,
+                )
+            else:
+                logger.info("[因子IC对齐] 无因子满足 min_days/min_abs_mean，保持 Config 原权重。")
+        engine.add_strategy(strategy_class, **strategy_params)
+        logger.info("当前策略: %s, 参数: %s", strategy_name, strategy_params)
+        dt_engine, t = _perf_phase(
+            "创建回测引擎并注册多因子策略",
+            "backtest/backtest_engine.py:BacktestEngine + add_strategy → strategies.PriceVolumeMultiFactorStrategy",
+            t,
+        )
 
         for data_feed in data_feeds:
             engine.add_data(data_feed)

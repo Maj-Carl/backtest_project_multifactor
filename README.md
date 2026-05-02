@@ -13,16 +13,16 @@
 - 在本机创建文件：`C:\投资\STOCK_API_KE.txt`
 - 文件内容仅放你的 key（纯文本一行）
 
-3) 先跑快速冒烟
+3) 跑一回主流程
 
-- `python run_multifactor.py --smoke`
-- 如需更快：`python run_multifactor.py --smoke --smoke-topk 3 --smoke-days 20`
+- `python run_multifactor.py`
+- 若只想用小股票池试跑：见下文「股票池」中的 `--manual-csv`
 
 ## 目录结构
 
 根目录建议仅保留入口与模块目录：
 
-- `run_multifactor.py`：主入口（全量 / 冒烟 / `--manual-csv` 自定义股票池）
+- `run_multifactor.py`：主入口（全量 / `--manual-csv` 自定义股票池等）
 - `backtest_main.py`：回测主流程编排
 - `config/`：全局配置
 - `data/`：数据获取、行情仓与股票池构建
@@ -38,12 +38,8 @@
 
 - 全量回测
   - `python run_multifactor.py`
-- 快速冒烟（推荐日常开发）
-  - `python run_multifactor.py --smoke`
-- 超小冒烟（更快）
-  - `python run_multifactor.py --smoke --smoke-topk 3 --smoke-days 20`
 - 调试模式（分类 DEBUG 日志写入 `logs/debug/*.log`）
-  - `python run_multifactor.py --debug`（可与 `--smoke` 等组合）
+  - `python run_multifactor.py --debug`
 - 主流程终端输出与 `logs/backtest.log` 一致（同一 logger：股票池提示、行情装载、在线抽样、接口重试、回测摘要等）；交易明细仍在 `logs/trading.log`，性能节点在 `logs/performance.log`。
 
 ## 数据接口调试（data/fetch/apis）
@@ -82,7 +78,6 @@
 
 ## 说明
 
-- 冒烟模式会自动缩小股票池和日期窗，但保留在线抽样与报告生成，用于小规模全能力验证。
 - 数据主仓目录由 `Config.MULTI_STOCK_CACHE_DIR` 控制（当前为 `C:\投资\STOCK_DATA`）。
 
 ## 常见问题（FAQ）
@@ -98,19 +93,14 @@
 ### 2) 报网络超时（ReadTimeout）
 
 - 这通常是接口波动，不一定是代码错误
-- 先用冒烟命令验证主链路：`python run_multifactor.py --smoke`
-- 如果全量回测频繁超时：缩小股票池与日期区间、或使用冒烟参数；必要时自备本地 Parquet/DuckDB 数据（或通过 `data/` 模块自写补仓逻辑）
+- 可先缩小股票池（`--manual-csv` 或小清单）、或在 `config/config.py` 中缩短回测日期区间
+- 若全量回测频繁超时：必要时自备本地 Parquet/DuckDB 数据（或通过 `data/` 模块自写补仓逻辑）
 
 ### 3) 控制台中文乱码
 
 - Windows 终端编码导致，通常不影响实际逻辑和结果
 - 可切换到 UTF-8 终端或在 IDE 内查看日志/报告文件
 
-### 4) 冒烟还是慢
-
-- 进一步压缩参数：`python run_multifactor.py --smoke --smoke-topk 3 --smoke-days 20`
-- 若仍慢，可再降到 `--smoke-topk 1 --smoke-days 10` 做最小链路验证
-
-### 5) 本地数据是否可信，怎么快速核验
+### 4) 本地数据是否可信，怎么快速核验
 
 - 回测链路在装载结束后会按需做「按日全日快照 × 抽样日 × 标的池」在线抽样（见 `Config.DATA_SAMPLING_CHECK_*`，接口不可用时整段跳过并打日志）。
