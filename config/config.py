@@ -48,7 +48,7 @@ class Config:
     # 股票池唯一持久化文件见 data/universe/a_share_codes.csv。
     # 自定义清单：`python run_multifactor.py --manual-csv <路径>`，或将脚本输出直接写入 a_share_codes.csv。
     MULTI_STOCK_CACHE_DIR = r"C:\投资\STOCK_DATA"
-    BENCHMARK_SYMBOL = "1.000300"
+    BENCHMARK_SYMBOL = "1.000001"  # 上证综指（东财带前缀代码）
     # 基准（指数）数据源固定使用接口A(api_stock_kline_dc)。
     BENCHMARK_FORCE_API_A = True
     DATA_SAMPLING_CHECK_ENABLED = True
