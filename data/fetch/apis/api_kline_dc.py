@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-from utils.logger import get_backtest_logger
+from utils.logger import LoggerConfig, get_backtest_logger, get_debug_logger
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -39,11 +39,35 @@ def fetch_kline_dc_payload(payload: dict, *, verbose: bool = True, max_retries: 
     """请求接口A并返回原始 JSON 载荷。"""
     data = None
     last_error = None
+    http_dbg = get_debug_logger("http") if LoggerConfig.DEBUG_MODE else None
     for attempt in range(1, max_retries + 1):
         try:
+            if http_dbg is not None:
+                http_dbg.debug(
+                    "[api_kline_dc] POST %s attempt=%s/%s codes=%s period=%s start=%s end=%s ty=%s adjust=%s",
+                    API_URL,
+                    attempt,
+                    max_retries,
+                    payload.get("codes"),
+                    payload.get("period"),
+                    payload.get("start_date"),
+                    payload.get("end_date"),
+                    payload.get("ty"),
+                    payload.get("adjust"),
+                )
             resp = requests.post(API_URL, data=payload, timeout=(5, 20))
             resp.raise_for_status()
             data = resp.json()
+            if http_dbg is not None:
+                rows = data.get("data") if isinstance(data, dict) else None
+                nrows = len(rows) if isinstance(rows, list) else 0
+                http_dbg.debug(
+                    "[api_kline_dc] OK attempt=%s http=%s rows=%s status_field=%s",
+                    attempt,
+                    resp.status_code,
+                    nrows,
+                    (data or {}).get("status") if isinstance(data, dict) else None,
+                )
             break
         except requests.exceptions.Timeout as exc:
             last_error = exc
@@ -67,6 +91,15 @@ def fetch_kline_dc_nonempty_payload(payload: dict, *, verbose: bool = True, max_
     """与 fetch_kline_dc_payload 相同，但 data 为空时抛出 ValueError。"""
     data = fetch_kline_dc_payload(payload, verbose=verbose, max_retries=max_retries)
     if not data.get("data"):
+        get_backtest_logger().warning(
+            "[接口A] 无 K 线行（将按错误处理）codes=%s period=%s start=%s end=%s ty=%s adjust=%s",
+            payload.get("codes"),
+            payload.get("period"),
+            payload.get("start_date"),
+            payload.get("end_date"),
+            payload.get("ty"),
+            payload.get("adjust"),
+        )
         raise ValueError("远程接口返回空数据，请检查参数或时间区间。")
     return data
 
@@ -77,6 +110,14 @@ def fetch_kline_dc_dataframe(payload: dict, *, verbose: bool = True, max_retries
     rows = data.get("data")
     cols = data.get("columns")
     if not rows or not cols:
+        get_backtest_logger().warning(
+            "[接口A] 转为 DataFrame 时无行/列 codes=%s period=%s start=%s end=%s ty=%s",
+            payload.get("codes"),
+            payload.get("period"),
+            payload.get("start_date"),
+            payload.get("end_date"),
+            payload.get("ty"),
+        )
         return pd.DataFrame()
     return pd.DataFrame(data=rows, columns=cols)
 

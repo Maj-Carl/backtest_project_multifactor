@@ -12,7 +12,7 @@ import random
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 import requests
@@ -22,7 +22,52 @@ from data.fetch.apis.api_kline_daily_th import fetch_daily_th_bars_for_code, fet
 from data.fetch.apis.api_kline_dc import fetch_kline_dc_nonempty_payload
 from data.fetch.trade_calendar import get_trade_days
 from data.storage.column_normalize import normalize_legacy_columns
+from data.universe.builder import UNIVERSE_CACHE_FILE
 from utils.logger import get_backtest_logger, get_debug_logger
+
+
+class BackfillFirstSegmentEmptyError(ValueError):
+    """日历缺口下第一段接口 B 补缺对该标的仍无行：已从 a_share_codes.csv 剔除，调用方应跳过本标的。"""
+
+    def __init__(self, code: str):
+        self.code = str(code).zfill(6)
+        super().__init__(
+            f"[{self.code}] 第一段 daily_th 补缺为空；"
+            f"为保证回测数据在回测交易日区间的完整性，已将 {self.code} 从股票池 "
+            f"{UNIVERSE_CACHE_FILE.name} 中剔除"
+        )
+
+
+def remove_codes_from_universe_cache(codes_to_remove: Sequence[str]) -> int:
+    """从持久化股票池 CSV 中批量移除代码。返回删除的行数。"""
+    if not codes_to_remove:
+        return 0
+    bad = {_normalize_symbol(str(c)) for c in codes_to_remove}
+    path = UNIVERSE_CACHE_FILE
+    if not path.exists():
+        return 0
+    try:
+        df = pd.read_csv(path, dtype={"code": str}, encoding="utf-8-sig")
+    except Exception:
+        get_backtest_logger().warning("读取股票池缓存失败，跳过剔池: %s", path)
+        return 0
+    if "code" not in df.columns:
+        return 0
+    work = df.copy()
+    work["_c6"] = (
+        work["code"].astype(str).str.extract(r"(\d{6})", expand=False).fillna("").str.zfill(6)
+    )
+    n0 = len(work)
+    work = work[~work["_c6"].isin(bad)].drop(columns=["_c6"], errors="ignore")
+    removed = n0 - len(work)
+    if removed <= 0:
+        return 0
+    if work.empty:
+        get_backtest_logger().warning(
+            "[行情补缺] 批量剔池后股票池缓存已无代码，仍写入空表（请尽快重建股票池）",
+        )
+    work.to_csv(path, index=False, encoding="utf-8-sig")
+    return removed
 
 
 def _run_info(msg: str, *, verbose: bool = True) -> None:
@@ -130,8 +175,7 @@ def _log_ingest_run(
 ):
     """写入 ``ingest_runs`` 审计行。
 
-    仅在已写 silver 并更新 ``bar_catalog`` 后由调用方触发：``load_or_update_bars``、
-    ``upsert_daily_th_snapshot_into_silver``。
+    仅在已写 silver 并更新 ``bar_catalog`` 后由 ``load_or_update_bars`` 触发。
     """
     if duckdb is None:
         return
@@ -284,6 +328,246 @@ def _get_expected_trade_days(
     )
 
 
+def compute_need_fetch_segments(
+    local: Optional[pd.DataFrame],
+    req_start: pd.Timestamp,
+    req_end: pd.Timestamp,
+    cache_dir: Path,
+    period: str,
+    ty: str,
+) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+    """与 ``load_or_update_bars`` 内缺口切段逻辑一致（供批处理预取交易日）。"""
+    if local is None or local.empty:
+        return [(req_start, req_end)]
+
+    local_in_range = local[(local["date"] >= req_start) & (local["date"] <= req_end)].copy()
+    have_dates = set(pd.to_datetime(local_in_range["date"]).dt.normalize().tolist())
+
+    expected = _get_expected_trade_days(cache_dir, period, ty, req_start, req_end)
+    missing = [d for d in expected if d.normalize() not in have_dates]
+    if not missing:
+        return []
+
+    segs: list[Tuple[pd.Timestamp, pd.Timestamp]] = []
+    seg_start = missing[0]
+    prev = missing[0]
+    for d in missing[1:]:
+        if (d - prev).days <= 3:
+            prev = d
+            continue
+        segs.append((seg_start, prev))
+        seg_start = d
+        prev = d
+    segs.append((seg_start, prev))
+    return segs
+
+
+def _read_parquet_for_gap_plan(canon: Path, code_z: str) -> Optional[pd.DataFrame]:
+    """仅读 date（及 code）用于缺口日历计算，减轻与正式装载的双读 IO。"""
+    if not canon.exists():
+        return None
+    try:
+        df = pd.read_parquet(canon, columns=["date", "code"])
+    except Exception:
+        try:
+            df = pd.read_parquet(canon, columns=["date"])
+        except Exception:
+            return None
+    df["date"] = pd.to_datetime(df["date"])
+    if "code" in df.columns:
+        df["code"] = df["code"].astype(str).map(_normalize_symbol)
+        df = df[df["code"] == code_z]
+    df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+    return df
+
+
+def _build_code_to_missing_trade_dates(
+    codes: Sequence[str],
+    start_date: str,
+    end_date: str,
+    *,
+    cache_dir: Path,
+    period: str,
+    ty: str,
+    use_local: bool,
+) -> Dict[str, Set[str]]:
+    """每标的在请求区间内、接口 B 补缺路径上仍缺的交易日（YYYY-MM-DD）。"""
+    if period != "1d" or ty != "个股":
+        return {}
+    req_start = pd.Timestamp(start_date)
+    req_end = pd.Timestamp(end_date)
+    storage_adjust = "0"
+    out: Dict[str, Set[str]] = {}
+    for raw in codes:
+        code_z = _normalize_symbol(
+            str(raw).strip().zfill(6) if str(raw).strip().isdigit() else raw
+        )
+        canon = canonical_bar_path(cache_dir, code_z, period, storage_adjust, ty)
+        merged: Optional[pd.DataFrame] = None
+        if use_local and canon.exists():
+            merged = _read_parquet_for_gap_plan(canon, code_z)
+        segs = compute_need_fetch_segments(
+            merged, req_start, req_end, cache_dir, period, ty
+        )
+        need: Set[str] = set()
+        for seg_start, seg_end in segs:
+            for d in get_trade_days(
+                seg_start,
+                seg_end,
+                cache_dir=cache_dir,
+                period=period,
+                ty=ty,
+            ):
+                need.add(d.strftime("%Y-%m-%d"))
+        if need:
+            out[code_z] = need
+    return out
+
+
+def incremental_daily_th_prune_and_fill_cache(
+    codes: Sequence[str],
+    start_date: str,
+    end_date: str,
+    *,
+    cache_dir: Path,
+    api_key: str,
+    period: str,
+    ty: str,
+    use_local: bool,
+) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
+    """按「当前缺口并集最早日」逐日拉全日快照；最早缺口日无行则剔池，每轮后并集自然收缩。"""
+    if period != "1d" or ty != "个股":
+        return {}, []
+
+    needed = _build_code_to_missing_trade_dates(
+        codes,
+        start_date,
+        end_date,
+        cache_dir=cache_dir,
+        period=period,
+        ty=ty,
+        use_local=use_local,
+    )
+    if not needed:
+        return {}, []
+
+    pruned: List[str] = []
+    pruned_set: Set[str] = set()
+    session_mkt: Dict[str, pd.DataFrame] = {}
+
+    total_pairs = sum(len(s) for s in needed.values())
+    max_guard = max(total_pairs * 2 + len(needed) * 200, 5000)
+    iter_count = 0
+
+    while iter_count < max_guard:
+        iter_count += 1
+        active = [c for c in needed if c not in pruned_set and needed[c]]
+        if not active:
+            break
+
+        union_sorted = sorted(set().union(*(needed[c] for c in active)))
+        if not union_sorted:
+            break
+        d = union_sorted[0]
+
+        if d not in session_mkt:
+            try:
+                session_mkt[d] = fetch_daily_th_market(api_key, d, verbose=False)
+            except Exception as exc:
+                get_backtest_logger().warning(
+                    "[接口B] 增量全日 date=%s 失败，跳过该日并继续: %s", d, exc
+                )
+                for c in active:
+                    needed[c].discard(d)
+                continue
+
+        mkt = session_mkt[d]
+        for c in list(active):
+            if c in pruned_set or c not in needed or not needed[c] or d not in needed[c]:
+                continue
+            first_missing = min(needed[c])
+            sub = (
+                mkt[mkt["code"].astype(str).map(_normalize_symbol) == c]
+                if len(mkt) > 0
+                else pd.DataFrame()
+            )
+            if d == first_missing and sub.empty:
+                pruned_set.add(c)
+                pruned.append(c)
+                needed[c] = set()
+                get_backtest_logger().warning(
+                    "[行情补缺] 增量：%s 在最早缺口日 %s 全日快照中无行；"
+                    "为保证回测数据在回测交易日区间的完整性，已将 %s 从股票池 %s 中剔除",
+                    c,
+                    d,
+                    c,
+                    UNIVERSE_CACHE_FILE.name,
+                )
+                continue
+            needed[c].discard(d)
+
+    active_remain = [c for c in needed if c not in pruned_set and needed[c]]
+    if active_remain:
+        get_backtest_logger().warning(
+            "[接口B] 增量全日未在迭代上限内跑完（上限=%s），剩余缺口仍走逐只装载",
+            max_guard,
+        )
+
+    return session_mkt, pruned
+
+
+def _slice_from_daily_th_prefetch(
+    code_z: str,
+    seg_start: str,
+    seg_end: str,
+    *,
+    prefetch: Dict[str, pd.DataFrame],
+    cache_dir: Path,
+) -> pd.DataFrame:
+    """从批预取全日快照中拼出某标的区间 K 线（列裁剪与 ``fetch_daily_th_bars_for_code`` 一致）。"""
+    parts: list[pd.DataFrame] = []
+    for d in get_trade_days(
+        seg_start,
+        seg_end,
+        cache_dir=cache_dir,
+        period="1d",
+        ty="个股",
+    ):
+        ds = d.strftime("%Y-%m-%d")
+        mkt = prefetch.get(ds)
+        if mkt is None or mkt.empty:
+            continue
+        sub = mkt[mkt["code"].astype(str).map(_normalize_symbol) == code_z]
+        if not sub.empty:
+            parts.append(sub)
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts, ignore_index=True)
+    keep = [
+        c
+        for c in (
+            "code",
+            "date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "amount",
+            "turnover",
+            "factor",
+            "is_paused",
+            "is_st",
+            "high_limit",
+            "low_limit",
+            "avg_price",
+            "prev_close",
+        )
+        if c in out.columns
+    ]
+    return out[keep].drop_duplicates(subset=["date"], keep="last").sort_values("date")
+
+
 def _fetch_slice_remote(
     code: str,
     start_date: str,
@@ -294,21 +578,38 @@ def _fetch_slice_remote(
     ty: str,
     verbose: bool,
     cache_dir: Optional[Path] = None,
+    daily_th_prefetch: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> pd.DataFrame:
     if period == "1d" and ty == "个股":
         if verbose:
             _run_info(
                 f"[{_normalize_symbol(code)}] 使用 daily_th 补缺 {start_date}~{end_date}"
             )
-        df = fetch_daily_th_bars_for_code(
-            _normalize_symbol(code),
-            start_date,
-            end_date,
-            api_key,
-            verbose=verbose,
-            cache_dir=cache_dir,
-        )
+        cdir = cache_dir if cache_dir is not None else Path(".")
+        if daily_th_prefetch is not None:
+            df = _slice_from_daily_th_prefetch(
+                _normalize_symbol(code),
+                start_date,
+                end_date,
+                prefetch=daily_th_prefetch,
+                cache_dir=cdir,
+            )
+        else:
+            df = fetch_daily_th_bars_for_code(
+                _normalize_symbol(code),
+                start_date,
+                end_date,
+                api_key,
+                verbose=verbose,
+                cache_dir=cdir,
+            )
         if df.empty:
+            get_backtest_logger().warning(
+                "[接口B] 区间未得到该标的行 code=%s %s~%s（可能未上市、停牌或全日快照中无此代码）",
+                _normalize_symbol(code),
+                start_date,
+                end_date,
+            )
             return pd.DataFrame()
         df = normalize_legacy_columns(df)
         if "code" in df.columns:
@@ -386,6 +687,7 @@ def load_or_update_bars(
     verbose: bool = True,
     log_each_symbol: bool = True,
     ingest_snapshots: Optional[List[dict[str, Any]]] = None,
+    daily_th_prefetch: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> pd.DataFrame:
     cache_dir.mkdir(parents=True, exist_ok=True)
     (cache_dir / "silver").mkdir(parents=True, exist_ok=True)
@@ -426,33 +728,10 @@ def load_or_update_bars(
 
         api_key = _ensure_api_key(key)
 
-        def need_fetch_segments(local: Optional[pd.DataFrame]) -> list[Tuple[pd.Timestamp, pd.Timestamp]]:
-            if local is None or local.empty:
-                return [(req_start, req_end)]
-
-            local_in_range = local[(local["date"] >= req_start) & (local["date"] <= req_end)].copy()
-            have_dates = set(pd.to_datetime(local_in_range["date"]).dt.normalize().tolist())
-
-            expected = _get_expected_trade_days(cache_dir, period, ty, req_start, req_end)
-            missing = [d for d in expected if d.normalize() not in have_dates]
-            if not missing:
-                return []
-
-            segs: list[Tuple[pd.Timestamp, pd.Timestamp]] = []
-            seg_start = missing[0]
-            prev = missing[0]
-            for d in missing[1:]:
-                if (d - prev).days <= 3:
-                    prev = d
-                    continue
-                segs.append((seg_start, prev))
-                seg_start = d
-                prev = d
-            segs.append((seg_start, prev))
-            return segs
-
         t0 = time.perf_counter()
-        segments = need_fetch_segments(merged)
+        segments = compute_need_fetch_segments(
+            merged, req_start, req_end, cache_dir, period, ty
+        )
         dt_gaps = time.perf_counter() - t0
         calendar_had_gaps = bool(segments)
 
@@ -501,9 +780,34 @@ def load_or_update_bars(
                 storage_adjust,
                 ty,
                 fetch_verbose,
+                cache_dir=cache_dir,
+                daily_th_prefetch=daily_th_prefetch,
             )
             dt_fetch += time.perf_counter() - t0
             if chunk.empty:
+                if (
+                    period == "1d"
+                    and ty == "个股"
+                    and si == 0
+                    and calendar_had_gaps
+                ):
+                    if ingest_snapshots is not None:
+                        ingest_snapshots.append(
+                            {
+                                "code": code_z,
+                                "ingest_message": "first_segment_daily_th_empty_pruned_universe",
+                                "merged_rows": int(len(merged)) if merged is not None else 0,
+                            }
+                        )
+                    get_backtest_logger().warning(
+                        "[行情补缺] %s 第一段接口 B 对该标的无行，终止本标的补仓；"
+                        "为保证回测数据在回测交易日区间的完整性，已将 %s 从股票池 %s 中剔除"
+                        "（股票池 CSV 在本阶段结束后批量写入）",
+                        code_z,
+                        code_z,
+                        UNIVERSE_CACHE_FILE.name,
+                    )
+                    raise BackfillFirstSegmentEmptyError(code_z)
                 continue
             merged_remote_rows = True
             t1 = time.perf_counter()
@@ -612,99 +916,6 @@ def load_or_update_bars(
         raise
     finally:
         _release_symbol_lock(lock_path)
-
-
-def upsert_daily_th_snapshot_into_silver(
-    cache_dir: Path,
-    market_df: pd.DataFrame,
-    *,
-    period: str = "1d",
-    adjust: str = "0",
-    ty: str = "个股",
-    code_filter: Optional[Set[str]] = None,
-    verbose: bool = False,
-) -> dict:
-    if market_df.empty:
-        return {"records_seen": 0, "skipped_filter": 0, "merged_files": 0, "failures": 0}
-
-    work = market_df.copy()
-    if "code" not in work.columns or "date" not in work.columns:
-        raise ValueError("market_df 需包含 code、date 列")
-    work["code"] = work["code"].astype(str).map(_normalize_symbol)
-    work["date"] = pd.to_datetime(work["date"])
-
-    counts = {"records_seen": int(len(work)), "skipped_filter": 0, "merged_files": 0, "failures": 0}
-
-    for code_z, grp in work.groupby("code"):
-        if code_filter is not None and code_z not in code_filter:
-            counts["skipped_filter"] += int(len(grp))
-            continue
-
-        row_df = grp.sort_values("date").tail(1)
-        lock_path: Optional[Path] = None
-        try:
-            lock_path = _acquire_symbol_lock(cache_dir, code_z, period, adjust, ty)
-            canon = canonical_bar_path(cache_dir, code_z, period, adjust, ty)
-            if canon.exists():
-                merged = _read_bars_parquet(canon)
-                if "code" in merged.columns:
-                    merged = merged[merged["code"].astype(str).map(_normalize_symbol) == code_z]
-            else:
-                merged = pd.DataFrame()
-
-            incoming = row_df.copy()
-            if merged is not None and not merged.empty:
-                incoming = incoming.reindex(columns=merged.columns)
-            else:
-                incoming["code"] = code_z
-                base_cols = [
-                    "date",
-                    "code",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                    "amount",
-                    "turnover",
-                ]
-                use_cols = [c for c in base_cols if c in incoming.columns]
-                incoming = incoming[use_cols]
-
-            if merged is None or merged.empty:
-                combined = incoming
-            else:
-                combined = pd.concat([merged, incoming], ignore_index=True, sort=False)
-
-            combined = combined.drop_duplicates(subset=["date"], keep="last").sort_values("date")
-            tmp_path = canon.with_suffix(".parquet.tmp")
-            combined.to_parquet(tmp_path, index=False)
-            os.replace(tmp_path, canon)
-            _update_catalog(cache_dir, code_z, period, adjust, ty, canon, combined)
-            counts["merged_files"] += 1
-            _dmin = pd.to_datetime(combined["date"]).min()
-            _dmax = pd.to_datetime(combined["date"]).max()
-            _log_ingest_run(
-                cache_dir,
-                run_id=uuid.uuid4().hex,
-                code=code_z,
-                period=period,
-                adjust=adjust,
-                ty=ty,
-                request_start=_dmin.strftime("%Y-%m-%d"),
-                request_end=_dmax.strftime("%Y-%m-%d"),
-                status="success",
-                message="upsert_daily_th_snapshot_into_silver",
-                rows_after=int(len(combined)),
-            )
-        except Exception as exc:
-            counts["failures"] += 1
-            if verbose:
-                _run_info(f"[{code_z}] daily_th 写入失败: {exc}")
-        finally:
-            _release_symbol_lock(lock_path)
-
-    return counts
 
 
 def _union_sorted_dates_from_loaded(code_to_df: Dict[str, pd.DataFrame]) -> list[pd.Timestamp]:
@@ -1042,83 +1253,4 @@ def batch_online_sample_check_daily_th_cross_section(
         "checked_pairs": total_checked,
         "mismatch_records": mismatches_agg[:20],
         "stopped_early_deadline": stopped_deadline,
-    }
-
-
-def compare_local_vs_remote(
-    code: str,
-    start_date: str,
-    end_date: str,
-    *,
-    cache_dir: Path,
-    period: str = "1d",
-    adjust: str = "0",
-    ty: str = "个股",
-    key: Optional[str] = None,
-    price_rtol: float = 1e-5,
-    price_atol: float = 0.01,
-    verbose: bool = True,
-) -> dict:
-    code_z = _normalize_symbol(code)
-    canon = canonical_bar_path(cache_dir, code_z, period, adjust, ty)
-    if not canon.exists():
-        return {"ok": False, "error": f"本地无档案: {canon}"}
-
-    local = _read_bars_parquet(canon)
-    if "code" in local.columns:
-        local = local[local["code"].astype(str).map(_normalize_symbol) == code_z]
-    req_start = pd.Timestamp(start_date)
-    req_end = pd.Timestamp(end_date)
-    local = local[(local["date"] >= req_start) & (local["date"] <= req_end)].copy()
-
-    api_key = _ensure_api_key(key)
-    remote = _fetch_slice_remote(
-        code_z,
-        start_date,
-        end_date,
-        api_key,
-        period,
-        adjust,
-        ty,
-        verbose=False,
-        cache_dir=cache_dir,
-    )
-    if remote.empty:
-        return {"ok": False, "error": "接口返回为空"}
-
-    if "code" in remote.columns:
-        remote = remote[remote["code"].astype(str).map(_normalize_symbol) == code_z]
-
-    L = local.set_index("date").sort_index()
-    R = remote.set_index("date").sort_index()
-    common = L.index.intersection(R.index)
-    if len(common) == 0:
-        return {"ok": False, "error": "本地与接口无重叠交易日"}
-
-    check_cols = [c for c in ["open", "high", "low", "close", "volume"] if c in L.columns and c in R.columns]
-    mismatches = []
-    for d in common:
-        row_l = L.loc[d]
-        row_r = R.loc[d]
-        for col in check_cols:
-            try:
-                v1, v2 = float(row_l[col]), float(row_r[col])
-            except (TypeError, ValueError):
-                continue
-            if abs(v1 - v2) > price_atol + price_rtol * max(abs(v1), abs(v2), 1.0):
-                mismatches.append({"date": str(d.date()), "col": col, "local": v1, "remote": v2})
-
-    ok = len(mismatches) == 0
-    sample = mismatches[:10]
-    if verbose:
-        _run_info(
-            f"校验 {code_z} {start_date}~{end_date}: 重叠 {len(common)} 日, 不一致 {len(mismatches)} 处"
-        )
-        if sample:
-            _run_info(f"示例: {sample[:3]}")
-    return {
-        "ok": ok,
-        "overlap_days": len(common),
-        "mismatch_count": len(mismatches),
-        "sample_mismatches": sample,
     }

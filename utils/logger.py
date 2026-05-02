@@ -141,7 +141,7 @@ def get_debug_logger(category: str = "general") -> logging.Logger:
     """按分类写入 ``logs/debug/<category>.log``（仅 ``DEBUG_MODE`` 为 True 时记录 DEBUG 级别）。
 
     建议分类名：``universe``（股票池）、``batch``（多标装载进度）、``bars``（单标补缺）、
-    ``pipeline``（回测主流程节点）、``sampling``（在线抽样）等。
+    ``pipeline``（回测主流程节点）、``sampling``（在线抽样）、``http``（DEBUG_MODE 下接口 A/B 请求摘要）等。
     """
     cat = _sanitize_debug_category(category)
     name = f"debug.{cat}"

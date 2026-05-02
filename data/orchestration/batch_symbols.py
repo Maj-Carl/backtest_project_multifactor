@@ -8,9 +8,14 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from data.fetch.api_keys import load_api_key
+from data.universe.builder import UNIVERSE_CACHE_FILE
 from data.storage.bar_store import (
+    BackfillFirstSegmentEmptyError,
     batch_online_sample_check_daily_th_cross_section,
+    incremental_daily_th_prune_and_fill_cache,
     load_or_update_bars,
+    remove_codes_from_universe_cache,
     reset_phase_a_microtimings,
     take_phase_a_microtimings,
 )
@@ -88,37 +93,89 @@ def get_multiple_stock_data(
         )
 
     reset_phase_a_microtimings()
-    t_load = time.perf_counter()
-    for idx, code in enumerate(codes):
-        code_key = str(code).zfill(6)
+    daily_th_prefetch = None
+    universe_pruned_codes: list[str] = []
+    inc_pruned_set: set[str] = set()
+    if period == "1d" and ty == "个股":
         try:
-            df = load_or_update_bars(
-                code_key,
+            api_k = key or load_api_key()
+            if not api_k:
+                raise ValueError("缺少 API Key。")
+            daily_th_prefetch, inc_pruned = incremental_daily_th_prune_and_fill_cache(
+                codes,
                 start_date,
                 end_date,
                 cache_dir=cache_dir,
+                api_key=api_k,
                 period=period,
-                adjust=adjust,
                 ty=ty,
-                key=key,
                 use_local=use_local,
-                verbose=verbose,
-                log_each_symbol=False,
-                ingest_snapshots=ingest_snapshots,
             )
-            staged_local_for_sampling[code_key] = df
-            df = df.copy()
-            df.set_index("date", inplace=True)
-            result[code_key] = df
+            universe_pruned_codes.extend(inc_pruned)
+            inc_pruned_set = set(inc_pruned)
+            if not daily_th_prefetch:
+                daily_th_prefetch = None
+            elif verbose:
+                get_backtest_logger().info(
+                    "[行情装载] 接口 B 增量全日：已缓存 %s 个交易日快照（剔池 %s 只后继续逐只装载）",
+                    len(daily_th_prefetch),
+                    len(inc_pruned),
+                )
         except Exception as exc:
-            if continue_on_error:
-                if verbose:
-                    get_backtest_logger().info(
-                        "[%s] 拉取失败（已跳过）: %s", code_key, exc
-                    )
+            get_backtest_logger().warning(
+                "[行情装载] 接口 B 增量预取未启用，回退逐标的请求: %s",
+                exc,
+            )
+            daily_th_prefetch = None
+            inc_pruned_set = set()
+
+    t_load = time.perf_counter()
+    for idx, code in enumerate(codes):
+        code_key = str(code).zfill(6)
+        if code_key in inc_pruned_set:
+            failed_codes.append(code_key)
+        else:
+            try:
+                df = load_or_update_bars(
+                    code_key,
+                    start_date,
+                    end_date,
+                    cache_dir=cache_dir,
+                    period=period,
+                    adjust=adjust,
+                    ty=ty,
+                    key=key,
+                    use_local=use_local,
+                    verbose=verbose,
+                    log_each_symbol=False,
+                    ingest_snapshots=ingest_snapshots,
+                    daily_th_prefetch=daily_th_prefetch,
+                )
+                staged_local_for_sampling[code_key] = df
+                df = df.copy()
+                df.set_index("date", inplace=True)
+                result[code_key] = df
+            except BackfillFirstSegmentEmptyError as exc:
+                universe_pruned_codes.append(code_key)
+                get_backtest_logger().warning(
+                    "[%s] 第一段补缺为空，跳过本标的；"
+                    "为保证回测数据在回测交易日区间的完整性，已将 %s 从股票池 %s 中剔除"
+                    "（股票池 CSV 在阶段 A 结束后批量写入）: %s",
+                    code_key,
+                    code_key,
+                    UNIVERSE_CACHE_FILE.name,
+                    exc,
+                )
                 failed_codes.append(code_key)
-            else:
-                raise
+            except Exception as exc:
+                if continue_on_error:
+                    if verbose:
+                        get_backtest_logger().info(
+                            "[%s] 拉取失败（已跳过）: %s", code_key, exc
+                        )
+                    failed_codes.append(code_key)
+                else:
+                    raise
 
         done = idx + 1
         if verbose and (done == 1 or done == total_n or done % report_every == 0):
@@ -149,6 +206,22 @@ def get_multiple_stock_data(
                 elapsed,
                 eta_s,
             )
+
+    if universe_pruned_codes:
+        uniq = list(dict.fromkeys(universe_pruned_codes))
+        n_rm = remove_codes_from_universe_cache(uniq)
+        preview = ",".join(uniq[:16])
+        if len(uniq) > 16:
+            preview += f" …等共{len(uniq)}只"
+        else:
+            preview = f"{preview}（共{len(uniq)}只）" if uniq else ""
+        get_backtest_logger().warning(
+            "[行情补缺] 阶段 A 结束：为保证回测数据在回测交易日区间的完整性，已将 %s 从股票池 %s 中剔除"
+            "（本次从缓存文件删除 %s 行）",
+            preview,
+            UNIVERSE_CACHE_FILE.name,
+            n_rm,
+        )
 
     t_after_phase_a = time.perf_counter()
     micro = take_phase_a_microtimings()

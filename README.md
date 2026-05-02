@@ -114,4 +114,3 @@
 ### 5) 本地数据是否可信，怎么快速核验
 
 - 回测链路在装载结束后会按需做「按日全日快照 × 抽样日 × 标的池」在线抽样（见 `Config.DATA_SAMPLING_CHECK_*`，接口不可用时整段跳过并打日志）。
-- 更细的手工区间对账可自行调用 `data.storage.bar_store.compare_local_vs_remote`，或从 Git 历史恢复已删除的运维脚本。
