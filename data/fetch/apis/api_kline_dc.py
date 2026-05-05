@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 API_URL = "http://39.98.238.239/api_stock_kline_dc/"
 DEFAULTS = {
-    "key_file": r"C:\投资\STOCK_API_KE.txt",
+    "key_file": r"C:\投资\STOCK_API_KEY.txt",
     "codes": "000001",
     "period": "1d",
     "start": "2025-04-15",

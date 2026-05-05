@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-DEFAULT_API_KEY_FILE_PATH = Path(r"C:\投资\STOCK_API_KE.txt")
+DEFAULT_API_KEY_FILE_PATH = Path(r"C:\投资\STOCK_API_KEY.txt")
 
 
 def load_api_key_from_file(file_path: Path | None = None) -> str | None:

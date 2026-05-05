@@ -34,7 +34,7 @@ _CACHE_MAX = 128
 
 # 本模块 ``main()`` 调试默认值。**不是**远端接口的完整参数表：HTTP 仅 ``key``+``date``（见模块说明）。
 DEFAULTS = {
-    "key_file": r"C:\投资\STOCK_API_KE.txt",
+    "key_file": r"C:\投资\STOCK_API_KEY.txt",
     "date": "2025-04-15",  # --mode market；与 HTTP 的 date 一致
     "code": "000001",  # --mode code_range
     "start": "2025-04-15",  # code_range：仅本机日历区间起点，非 HTTP 查询参数

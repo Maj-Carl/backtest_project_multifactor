@@ -10,7 +10,7 @@
 
 2) 配置 API Key
 
-- 在本机创建文件：`C:\投资\STOCK_API_KE.txt`
+- 在本机创建文件：`C:\投资\STOCK_API_KEY.txt`
 - 文件内容仅放你的 key（纯文本一行）
 
 3) 跑一回主流程
