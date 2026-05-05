@@ -1,7 +1,10 @@
 """多因子策略实现：截面处理后的因子加权评分、目标权重与再平衡。"""
+from __future__ import annotations
+
 import math
 
 import backtrader as bt
+import pandas as pd
 
 from utils.logger import get_backtest_logger, get_trade_logger
 
@@ -41,6 +44,7 @@ class PriceVolumeMultiFactorStrategy(bt.Strategy):
         ("defense_gross_exposure", 0.58),
         ("defense_dd_deep", 0.22),
         ("defense_gross_exposure_deep", 0.38),
+        ("rolling_ic_signs", None),
     )
 
     def __init__(self):
@@ -50,6 +54,8 @@ class PriceVolumeMultiFactorStrategy(bt.Strategy):
         self.last_rebalance_bar = -9999
         self._equity_peak = 0.0
         self._last_applied_gross = 1.0
+        ric = getattr(self.p, "rolling_ic_signs", None)
+        self._rolling_ic_signs = ric if isinstance(ric, pd.DataFrame) and not ric.empty else None
 
     def _trade_log_date(self) -> str:
         try:
@@ -129,9 +135,53 @@ class PriceVolumeMultiFactorStrategy(bt.Strategy):
         except (TypeError, ValueError, IndexError):
             return float("nan")
 
+    def _ic_sign_row(self) -> pd.Series | None:
+        """当前 bar 日期对应的预计算 IC 权重符号行（无表或缺日则 None，表示全 +1）。"""
+        if self._rolling_ic_signs is None:
+            return None
+        try:
+            ts = pd.Timestamp(self.datetime.datetime(0)).normalize()
+        except Exception:
+            return None
+        try:
+            return self._rolling_ic_signs.loc[ts]
+        except KeyError:
+            sub = self._rolling_ic_signs.loc[:ts]
+            if sub.empty:
+                return None
+            return sub.iloc[-1]
+
+    def _ic_sign(self, row: pd.Series | None, fac: str) -> float:
+        if row is None:
+            return 1.0
+        key = f"sign_{fac}"
+        if key not in row.index:
+            return 1.0
+        v = row[key]
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return 1.0
+        return -1.0 if x < 0 else 1.0
+
     def _collect_scores(self):
-        """截面因子已为 z-score（列 mom20…），此处仅线性加权。"""
+        """截面因子已为 z-score（列 mom20…），此处线性加权；可选按日 IC 符号乘在 w_* 上。"""
         score_names = ("mom20", "mom60", "vol20", "liq20", "rev20", "dvol20", "amihud20")
+        sign_row = self._ic_sign_row()
+        s20 = self._ic_sign(sign_row, "mom20")
+        s60 = self._ic_sign(sign_row, "mom60")
+        sv = self._ic_sign(sign_row, "vol20")
+        sl = self._ic_sign(sign_row, "liq20")
+        sr = self._ic_sign(sign_row, "rev20")
+        sdv = self._ic_sign(sign_row, "dvol20")
+        sa = self._ic_sign(sign_row, "amihud20")
+        w20 = float(self.p.w_mom20) * s20
+        w60 = float(self.p.w_mom60) * s60
+        wv = float(self.p.w_vol20) * sv
+        wl = float(self.p.w_liq20) * sl
+        wr = float(self.p.w_rev20) * sr
+        wdv = float(self.p.w_dvol20) * sdv
+        wa = float(self.p.w_amihud20) * sa
         scores = {}
         for data in self.datas:
             if len(data) < 65:
@@ -152,13 +202,13 @@ class PriceVolumeMultiFactorStrategy(bt.Strategy):
                 za,
             ) = vals
             score = (
-                self.p.w_mom20 * z20
-                + self.p.w_mom60 * z60
-                + self.p.w_vol20 * zv
-                + self.p.w_liq20 * zl
-                + self.p.w_rev20 * zr
-                + self.p.w_dvol20 * zdv
-                + self.p.w_amihud20 * za
+                w20 * z20
+                + w60 * z60
+                + wv * zv
+                + wl * zl
+                + wr * zr
+                + wdv * zdv
+                + wa * za
             )
             if math.isnan(score):
                 continue

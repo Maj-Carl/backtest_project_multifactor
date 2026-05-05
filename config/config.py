@@ -23,10 +23,10 @@ class Config:
     FACTOR_WINSOR_HIGH = 0.99
     FACTOR_CS_MIN_NAMES = 40
     FACTOR_IC_REPORT = True
-    # 全市场截面：用日度 Rank IC 在全样本（或前缀区间）上的 mean_ic 符号，对策略里对应 w_* 做取反，使打分方向与未来收益正相关
+    # 全市场截面：按日滚动 IC 符号对齐 w_*（见 data/factors/ic_report.py:build_rolling_ic_weight_signs）。
     FACTOR_IC_ALIGN_WEIGHTS = True
-    # 仅用前 ratio 个交易日的 IC 序列估 mean_ic（<1 时减轻「用整段未来估权」的偷看；=1 与 IC 报告全样本一致）
-    FACTOR_IC_ALIGN_PREFIX_RATIO = 1.0
+    # 用过去 window 根「有 IC 的交易日」的滚动均值（且 shift(1)）预计算 sign_*；=0 则关闭 IC 符号对齐。
+    FACTOR_IC_ALIGN_ROLLING_WINDOW = 60
     FACTOR_IC_ALIGN_MIN_DAYS = 40
     FACTOR_IC_ALIGN_MIN_ABS_MEAN = 0.0
 

@@ -1,8 +1,7 @@
-"""因子 Rank IC（Spearman）与 IC_IR 摘要；可选按全市场截面 IC 符号对齐策略权重。"""
+"""因子 Rank IC（Spearman）与 IC_IR 摘要；按日滚动 IC 符号预计算（见 build_rolling_ic_weight_signs）。"""
 
 from __future__ import annotations
 
-import math
 import os
 from datetime import datetime
 from typing import Iterable
@@ -20,17 +19,6 @@ FACTOR_COLS_IC = (
     "dvol20",
     "amihud20",
 )
-
-# 与 strategies.PriceVolumeMultiFactorStrategy 中 w_* 参数名一致
-FACTOR_TO_WEIGHT_PARAM: dict[str, str] = {
-    "mom20": "w_mom20",
-    "mom60": "w_mom60",
-    "vol20": "w_vol20",
-    "liq20": "w_liq20",
-    "rev20": "w_rev20",
-    "dvol20": "w_dvol20",
-    "amihud20": "w_amihud20",
-}
 
 
 def _multi_to_ic_long(multi_data: dict[str, pd.DataFrame], cols: Iterable[str]) -> pd.DataFrame:
@@ -96,51 +84,43 @@ def ic_summary_from_daily(ic_daily: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(summary_rows)
 
 
-def truncate_ic_daily_for_align(ic_daily: pd.DataFrame, prefix_ratio: float) -> pd.DataFrame:
-    """仅用前若干交易日的日度 IC 估计 mean_ic，prefix_ratio=1 为全样本。"""
-    if ic_daily.empty:
-        return ic_daily
-    r = float(prefix_ratio)
-    if r >= 1.0 - 1e-12:
-        return ic_daily
-    r = max(1e-6, min(1.0, r))
-    n = max(30, int(len(ic_daily) * r))
-    n = min(n, len(ic_daily))
-    return ic_daily.iloc[:n]
-
-
-def align_strategy_weights_by_ic_summary(
-    base_params: dict,
-    summary: pd.DataFrame | None,
+def build_rolling_ic_weight_signs(
+    ic_daily: pd.DataFrame,
     *,
-    min_days: int = 40,
+    window: int,
+    min_periods: int,
     min_abs_mean: float = 0.0,
-) -> tuple[dict, dict[str, float]]:
-    """按各因子 mean_ic 符号调整 w_*：mean_ic>0 保持，mean_ic<0 权重取反；无效则保持原权重。
+) -> pd.DataFrame:
+    """按交易日预计算各因子在打分时的权重乘子（+1 / -1）。
 
-    返回 (新参数字典, 各因子实际乘的 sign，仅含被调整因子)。
+    在日历日 *t* 使用的符号，仅依赖 **严格早于 t** 的日度 IC：对每列先做
+    ``rolling(window).mean().shift(1)``，再与 ``min_abs_mean`` 比较后取符号；
+    不足窗宽、均值为 NaN、或 |均值| < min_abs_mean 时乘子为 +1（不翻转）。
+
+    说明：日度 IC 本身已含 ``fwd_ret_5``；此处 ``shift(1)`` 避免在 *t* 使用当日 IC 行。
     """
-    out = dict(base_params)
-    signs_applied: dict[str, float] = {}
-    if summary is None or summary.empty:
-        return out, signs_applied
-    for _, row in summary.iterrows():
-        fac = str(row.get("factor", ""))
-        param = FACTOR_TO_WEIGHT_PARAM.get(fac)
-        if param is None or param not in out:
+    if ic_daily.empty or int(window) <= 0:
+        return pd.DataFrame()
+    w = max(1, int(window))
+    mp = max(1, min(int(min_periods), w))
+    thr = float(min_abs_mean)
+    base = ic_daily.copy()
+    base.index = pd.to_datetime(base.index, errors="coerce").normalize()
+    out = pd.DataFrame(index=base.index)
+    for fac in FACTOR_COLS_IC:
+        col_name = f"sign_{fac}"
+        if fac not in base.columns:
+            out[col_name] = 1.0
             continue
-        n = int(row.get("n_days") or 0)
-        m = row.get("mean_ic")
-        if n < min_days or m is None or (isinstance(m, float) and math.isnan(m)):
-            continue
-        mf = float(m)
-        if abs(mf) < float(min_abs_mean):
-            continue
-        sgn = 1.0 if mf >= 0.0 else -1.0
-        if sgn < 0:
-            signs_applied[fac] = sgn
-            out[param] = float(out[param]) * sgn
-    return out, signs_applied
+        s = pd.to_numeric(base[fac], errors="coerce")
+        roll = s.rolling(window=w, min_periods=mp).mean().shift(1)
+        mult = pd.Series(1.0, index=base.index, dtype=float)
+        valid = roll.notna()
+        strong = valid & (roll.abs() >= thr)
+        mult[strong & (roll < 0.0)] = -1.0
+        mult[strong & (roll >= 0.0)] = 1.0
+        out[col_name] = mult
+    return out
 
 
 def maybe_write_factor_ic_report(

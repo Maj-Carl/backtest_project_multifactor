@@ -9,11 +9,9 @@ import requests
 from data.orchestration.batch_symbols import get_multiple_stock_data
 from data.features.price_factors import add_factor_columns
 from data.factors.ic_report import (
-    align_strategy_weights_by_ic_summary,
     build_ic_daily_from_multi,
-    ic_summary_from_daily,
+    build_rolling_ic_weight_signs,
     maybe_write_factor_ic_report,
-    truncate_ic_daily_for_align,
 )
 from data.factors.panel import apply_cross_section_to_multi_data
 from data.orchestration.single_symbol import get_stock_data
@@ -34,12 +32,12 @@ from utils.logger import (
 
 
 def get_multifactor_data_feeds(manual_csv_path=None):
-    """构建多因子策略所需的多标的 data feed 列表，并可选返回用于 IC 符号对齐的摘要表。
+    """构建多因子策略所需的多标的 data feed 列表，并可选返回按日滚动 IC 符号表。
 
     manual_csv_path: 仅由 ``run_multifactor.py --manual-csv`` 传入；规范化后会写入 a_share_codes.csv。
 
     Returns:
-        (feeds, ic_align_summary): ic_align_summary 在关闭 FACTOR_IC_ALIGN_WEIGHTS 时为 None。
+        (feeds, rolling_ic_signs): rolling_ic_signs 在关闭 IC 对齐或 window=0 时为 None。
     """
     t_u0 = time.perf_counter()
     codes = build_universe_codes(
@@ -99,8 +97,9 @@ def get_multifactor_data_feeds(manual_csv_path=None):
         factor_df = add_factor_columns(df)
         if not factor_df.empty:
             with_factors[code] = factor_df
-    need_ic = getattr(Config, "FACTOR_IC_REPORT", False) or getattr(
-        Config, "FACTOR_IC_ALIGN_WEIGHTS", False
+    roll_w = int(getattr(Config, "FACTOR_IC_ALIGN_ROLLING_WINDOW", 0) or 0)
+    need_ic = getattr(Config, "FACTOR_IC_REPORT", False) or (
+        getattr(Config, "FACTOR_IC_ALIGN_WEIGHTS", False) and roll_w > 0
     )
     ic_daily = None
     if need_ic:
@@ -111,11 +110,19 @@ def get_multifactor_data_feeds(manual_csv_path=None):
         enabled=getattr(Config, "FACTOR_IC_REPORT", False),
         ic_daily_precomputed=ic_daily,
     )
-    ic_align_summary = None
-    if getattr(Config, "FACTOR_IC_ALIGN_WEIGHTS", False) and ic_daily is not None and not ic_daily.empty:
-        ratio = float(getattr(Config, "FACTOR_IC_ALIGN_PREFIX_RATIO", 1.0))
-        sub = truncate_ic_daily_for_align(ic_daily, ratio)
-        ic_align_summary = ic_summary_from_daily(sub)
+    rolling_ic_signs = None
+    if (
+        getattr(Config, "FACTOR_IC_ALIGN_WEIGHTS", False)
+        and roll_w > 0
+        and ic_daily is not None
+        and not ic_daily.empty
+    ):
+        rolling_ic_signs = build_rolling_ic_weight_signs(
+            ic_daily,
+            window=roll_w,
+            min_periods=int(getattr(Config, "FACTOR_IC_ALIGN_MIN_DAYS", 40)),
+            min_abs_mean=float(getattr(Config, "FACTOR_IC_ALIGN_MIN_ABS_MEAN", 0.0)),
+        )
     cs_data = apply_cross_section_to_multi_data(
         with_factors,
         winsor_low=getattr(Config, "FACTOR_WINSOR_LOW", 0.01),
@@ -138,7 +145,7 @@ def get_multifactor_data_feeds(manual_csv_path=None):
     if not feeds:
         raise RuntimeError("有效多标的 data feed 为空，请检查数据区间或股票池过滤条件。")
     plog.debug("feeds built: n=%s", len(feeds))
-    return feeds, ic_align_summary
+    return feeds, rolling_ic_signs
 
 
 def get_benchmark_data():
@@ -267,8 +274,10 @@ def main(manual_csv_path=None, refresh_universe=False):
         # 1. 初始化回测引擎
         engine = BacktestEngine()
 
-        # 2. 多标的数据与 Feed（先于策略：全市场截面 IC 可对权重做符号对齐）
-        data_feeds, ic_align_summary = get_multifactor_data_feeds(manual_csv_path=manual_csv_path)
+        # 2. 多标的数据与 Feed（先于策略：可选按日滚动 IC 符号表）
+        data_feeds, rolling_ic_signs = get_multifactor_data_feeds(
+            manual_csv_path=manual_csv_path
+        )
         dt_feeds, t = _perf_phase(
             "整段：股票池 + 批量行情 + 因子列 + Feed 列表（见数据子阶段明细）",
             "backtest_main.py:get_multifactor_data_feeds()",
@@ -279,21 +288,19 @@ def main(manual_csv_path=None, refresh_universe=False):
         strategy_name = "PriceVolumeMultiFactorStrategy"
         strategy_class = strategy_module.PriceVolumeMultiFactorStrategy
         strategy_params = dict(Config.get_strategy_params())
-        if getattr(Config, "FACTOR_IC_ALIGN_WEIGHTS", False) and ic_align_summary is not None:
-            strategy_params, signs = align_strategy_weights_by_ic_summary(
-                strategy_params,
-                ic_align_summary,
-                min_days=int(getattr(Config, "FACTOR_IC_ALIGN_MIN_DAYS", 40)),
-                min_abs_mean=float(getattr(Config, "FACTOR_IC_ALIGN_MIN_ABS_MEAN", 0.0)),
-            )
-            if signs:
+        if getattr(Config, "FACTOR_IC_ALIGN_WEIGHTS", False):
+            rw = int(getattr(Config, "FACTOR_IC_ALIGN_ROLLING_WINDOW", 0) or 0)
+            if rolling_ic_signs is not None and not rolling_ic_signs.empty:
+                strategy_params["rolling_ic_signs"] = rolling_ic_signs
                 logger.info(
-                    "[因子IC对齐] 已按全市场截面 mean_ic 符号调整权重: %s | 完整参数: %s",
-                    signs,
-                    strategy_params,
+                    "[因子IC对齐] 已启用滚动 IC 符号表（按日查表），window=%s 行数=%s",
+                    rw,
+                    len(rolling_ic_signs),
                 )
+            elif rw <= 0:
+                logger.info("[因子IC对齐] 已开启但 FACTOR_IC_ALIGN_ROLLING_WINDOW=0，跳过符号对齐。")
             else:
-                logger.info("[因子IC对齐] 无因子满足 min_days/min_abs_mean，保持 Config 原权重。")
+                logger.warning("[因子IC对齐] 日度 IC 为空，无法生成滚动符号表。")
         engine.add_strategy(strategy_class, **strategy_params)
         logger.info("当前策略: %s, 参数: %s", strategy_name, strategy_params)
         dt_engine, t = _perf_phase(
