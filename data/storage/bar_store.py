@@ -692,7 +692,8 @@ def load_or_update_bars(
     cache_dir.mkdir(parents=True, exist_ok=True)
     (cache_dir / "silver").mkdir(parents=True, exist_ok=True)
     requested_adjust = str(adjust)
-    storage_adjust = "0" if (period == "1d" and ty == "个股") else requested_adjust
+    # 远端请求与本地 parquet 文件名中的 adjust 段恒为 "0"（不复权）；出口再按 requested_adjust 折算。
+    storage_adjust = "0"
     canon = canonical_bar_path(cache_dir, code, period, storage_adjust, ty)
     code_z = _normalize_symbol(code)
     run_id = uuid.uuid4().hex

@@ -67,7 +67,7 @@ def get_multifactor_data_feeds(manual_csv_path=None):
     )
     logger.info("多因子股票池数量: %s", len(codes))
     t_b0 = time.perf_counter()
-    _adj = getattr(Config, "BACKTEST_ADJUST", Config.DEFAULT_ADJUST)
+    _adj = Config.BACKTEST_ADJUST
     multi_data = get_multiple_stock_data(
         codes=codes,
         period=Config.DEFAULT_PERIOD,
@@ -149,7 +149,7 @@ def get_benchmark_data():
             period=Config.DEFAULT_PERIOD,
             start_date=Config.DEFAULT_START_DATE,
             end_date=Config.DEFAULT_END_DATE,
-            adjust=getattr(Config, "BACKTEST_ADJUST", Config.DEFAULT_ADJUST),
+            adjust=Config.BACKTEST_ADJUST,
             ty='指数',
             use_local=True,
             verbose=False

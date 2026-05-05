@@ -14,14 +14,8 @@ class Config:
     DEFAULT_START_DATE = '2025-04-15'
     DEFAULT_END_DATE = '2026-04-15'
     DEFAULT_PERIOD = '1d'
-    # 本地主数据源（new_dataa）是无复权口径。
-    # DEFAULT_ADJUST 取值说明：
-    # 0 = raw（无复权）：使用原始价格；适合与原始成交额/量等字段保持一致做核对。
-    # 1 = fwd（前复权）：历史价格按最新复权因子对齐；策略回测最常用，收益曲线更平滑可比。
-    # 2 = bwd（后复权）：历史价格按当期因子累计；适合长期序列连续性分析与历史价格形态观察。
-    DEFAULT_ADJUST = "0"
-    DATA_IS_UNADJUSTED = True
-    # 回测主链路（个股 + 基准）使用的复权口径；多因子动量/波动建议前复权 "1"
+    # 拉数与本地 silver 一律不复权（adjust=0 落盘）。仅在读出时按本字段用 factor 折算 OHLC。
+    # 取值：0=不折算；1=前复权；2=后复权（与 bar_store._apply_adjust_to_ohlc 一致）。多因子常用 "1"。
     BACKTEST_ADJUST = "1"
 
     # 截面因子：分位去极值 + 对 log_size 中性 + z-score
