@@ -1,4 +1,4 @@
-# backtest_project_429
+# backtest_project_multifactor
 
 仅保留多因子策略的 A 股回测工程，使用本地 Parquet 行情仓 + DuckDB catalog。
 
